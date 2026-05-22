@@ -298,8 +298,19 @@ class TokenAligner:
         ]
 
         per_sample_pairs: List[List[Tuple[Any, ...]]] = []
-        for s_toks, t_toks in zip(student_token_lists, teacher_token_lists):
-            pairs = self._align_single(s_toks, t_toks)
+        for i, (s_toks, t_toks) in enumerate(
+            zip(student_token_lists, teacher_token_lists)
+        ):
+            # Pass original token-ID lists + tokenizers so _alignment_mask can
+            # fall back to NFC-normalised decoded text when canonical-string
+            # compare misses (CJK byte-encoding diffs, whitespace-split
+            # asymmetry between e.g. SentencePiece ▁ and GPT-2 Ġ).
+            pairs = self._align_single(
+                s_toks,
+                t_toks,
+                student_ids_seq=student_ids[i].tolist(),
+                teacher_ids_seq=teacher_ids[i].tolist(),
+            )
             per_sample_pairs.append(pairs)
 
         return self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
@@ -381,6 +392,8 @@ class TokenAligner:
         combination_score_multiplier: float = 1.5,
         gap_penalty: float = -1.5,
         anchor_lengths: Tuple[int, ...] = (3,),
+        student_ids_seq: List[int] | None = None,
+        teacher_ids_seq: List[int] | None = None,
     ) -> List[Tuple[Any, ...]]:
         """Run canonicalize -> anchor-DP -> post-process for one sample.
 
@@ -410,9 +423,17 @@ class TokenAligner:
             gap_penalty=gap_penalty,
             max_combination_len=self.max_combination_len,
         )
-        # Attach is_correct mask using canonicalized comparison so that
-        # ignore_leading_char_diff=True semantics are baked in upstream.
-        is_correct = _alignment_mask(aligned)
+        # Attach is_correct mask. When original IDs + tokenizers are provided,
+        # the mask falls back to NFC-normalised decoded comparison when the
+        # canonical-string check says BAD — catches CJK byte-encoding diffs
+        # and whitespace-split asymmetry between tokenizer families.
+        is_correct = _alignment_mask(
+            aligned,
+            student_ids_seq=student_ids_seq,
+            teacher_ids_seq=teacher_ids_seq,
+            student_tokenizer=self.student_tokenizer,
+            teacher_tokenizer=self.teacher_tokenizer,
+        )
         return [(s_t, t_t, s0, s1, t0, t1, m) for (s_t, t_t, s0, s1, t0, t1), m in zip(aligned, is_correct)]
 
     # ------------------------------------------------------------------ #
@@ -546,12 +567,14 @@ def _canonical_token(token: str) -> str:
         token = "\n"
     elif token == "\\n":
         token = "\n"
-    elif token == "ĉ":
-        token = "\n"
+    elif token == "ĉ":  # GPT byte-level encoding for 0x09 = TAB
+        token = "\t"
     elif token == "Ġ\n":
         token = "\n"
     elif "Ċ" in token:
         token = token.replace("Ċ", "\n")
+    elif "ĉ" in token:  # Handle ĉ (tab) embedded in other tokens
+        token = token.replace("ĉ", "\t")
     elif "\\n" in token:
         token = token.replace("\\n", "\n")
 
@@ -824,13 +847,71 @@ def _shift_pairs(
     return out
 
 
-def _alignment_mask(aligned_pairs: List[Tuple[Any, ...]]) -> List[bool]:
-    """Compute is_correct for each pair using canonicalized text comparison."""
+def _alignment_mask(
+    aligned_pairs: List[Tuple[Any, ...]],
+    student_ids_seq: List[int] | None = None,
+    teacher_ids_seq: List[int] | None = None,
+    student_tokenizer: Any = None,
+    teacher_tokenizer: Any = None,
+) -> List[bool]:
+    """Compute is_correct for each pair using canonicalized text comparison.
+
+    When the four optional args are all provided AND the canonical-string
+    compare flags a pair as BAD, falls back to decoding the original ID spans
+    and comparing NFC-normalised UTF-8 text. Three fallback tiers:
+      1. Raw NFC equality — catches CJK byte-encoding diffs where token
+         strings differ but decoded text is identical (e.g. 'の').
+      2. Stripped equality (non-empty) — catches whitespace-split asymmetry
+         like ``['Ġ', '\\n']`` vs ``['Ġ\\n']``.
+      3. Both-whitespace equivalence — both decoded strings are pure but
+         non-empty whitespace (covers ▁ vs Ġ etc.).
+    Ported from tokenalign_upstream's pavlo-branch fix
+    (`tokenalign_pavlo/tokenalign.py:2270-2353`).
+    """
+    decode_fallback = (
+        student_ids_seq is not None
+        and teacher_ids_seq is not None
+        and student_tokenizer is not None
+        and teacher_tokenizer is not None
+    )
     out: List[bool] = []
-    for s_toks, t_toks, *_rest in aligned_pairs:
+    for pair in aligned_pairs:
+        s_toks, t_toks, s_start, s_end, t_start, t_end, *_rest = pair
         s_canon = "".join(_canonical_token(tk) for tk in s_toks) if s_toks else ""
         t_canon = "".join(_canonical_token(tk) for tk in t_toks) if t_toks else ""
-        out.append(_strings_equal_flexible(s_canon, t_canon, ignore_leading_char_diff=False))
+        is_correct = _strings_equal_flexible(
+            s_canon, t_canon, ignore_leading_char_diff=False
+        )
+        if (
+            not is_correct
+            and decode_fallback
+            and s_start != -1
+            and t_start != -1
+            and s_start < s_end
+            and t_start < t_end
+        ):
+            try:
+                import unicodedata as _ud
+                s_dec = student_tokenizer.decode(
+                    student_ids_seq[s_start:s_end], skip_special_tokens=False
+                )
+                t_dec = teacher_tokenizer.decode(
+                    teacher_ids_seq[t_start:t_end], skip_special_tokens=False
+                )
+                s_norm = _ud.normalize("NFC", s_dec)
+                t_norm = _ud.normalize("NFC", t_dec)
+                if s_norm and s_norm == t_norm:
+                    is_correct = True
+                else:
+                    s_stripped = s_norm.strip()
+                    t_stripped = t_norm.strip()
+                    if s_stripped and s_stripped == t_stripped:
+                        is_correct = True
+                    elif s_norm and t_norm and not s_stripped and not t_stripped:
+                        is_correct = True
+            except Exception:
+                pass
+        out.append(is_correct)
     return out
 
 
