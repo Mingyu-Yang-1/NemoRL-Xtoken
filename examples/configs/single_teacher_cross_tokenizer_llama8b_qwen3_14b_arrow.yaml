@@ -1,0 +1,188 @@
+# Single-teacher cross-tokenizer distillation: Llama-3.1-8B ← Qwen3-14B-Base
+#
+# Ported from xtoken_nemorl_v1/examples/configs/single_teacher_cross_tokenizer_llama8b_qwen3_32b_arrow.yaml
+# to the xtoken_nemorl_github_latest schema (xtoken_distillation.yaml shape).
+#
+# Student : meta-llama/Llama-3.1-8B   (vocab=128256, Llama-3 tokenizer)
+# Teacher : Qwen/Qwen3-14B-Base       (vocab=151936, Qwen3 tokenizer)
+# Data    : CLIMB NM5.5 Phase 3 arrow (~1000 shards, lazy packing at data layer)
+# Steps   : 10000  (LinearLR warmup over 100 → CosineAnnealing T_max=9900 → 0)
+# Batch   : global=768 (1 seq/GPU × 256 GPUs on 32 nodes × 8 GPUs/node)
+# Loss    : P-KL (gold_loss=false, xtoken_loss=false)
+#           Full-vocab teacher logits transported via IPC; loss derives a
+#           microbatch-global top-k (vocab_topk=8192), projects student to
+#           teacher vocab via M, chunk-averages KL. CE term scaled by 0.1.
+#
+# Projection matrix: Llama-3.1 (128256) → Qwen3 tokenizer (151936) via
+# multi-token decode rule, top-4 entries per row. Qwen3-14B-Base shares the
+# same tokenizer as Qwen3-32B, so the existing 32B-named map is the right
+# one to use.
+
+distillation:
+  num_prompts_per_step: 768
+  max_num_steps: 10000
+  max_num_epochs: 100
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  projection_matrix_path: "/lustre/fsw/portfolios/coreai/users/mingyyang/xtoken_nemorl_v1/cross_tokenizer_data/projection_map_Llama-3.1_to_Qwen3-32B_multitoken_top_4_special.pt"
+  gold_loss: false
+  xtoken_loss: false
+  temperature: 1.0
+  vocab_topk: 8192
+  uncommon_topk: 8192
+  reverse_kl: false
+  exact_token_match_only: false
+  project_teacher_to_student: false
+  kl_loss_weight: 1.0
+  ce_loss_scale: 0.1
+  dynamic_loss_scaling: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/single-teacher-llama8b-qwen3-14b-base-pkl"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 10
+  save_period: 100
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B"
+  tokenizer:
+    name: "meta-llama/Llama-3.1-8B"
+    chat_template: null
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: true            # offload student params to CPU to free GPU memory for teacher init
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 100
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 9900           # steps 101–10000
+        eta_min: 0.0
+    - milestones: [100]
+  generation: null
+
+teacher:
+  model_name: "Qwen/Qwen3-14B-Base"
+  tokenizer:
+    name: "Qwen/Qwen3-14B-Base"
+    chat_template: null
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    load_precision: "bfloat16"    # load teacher weights directly in bf16 to reduce init peak memory
+    shard_before_load: true       # apply FSDP sharding before materializing/loading weights
+    cpu_offload: true            # 14B teacher — offload to relieve GPU memory
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  generation: null
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: "arrow_text"
+    processor: "kd_data_processor"
+    arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00[0-9][0-9][0-9]-of-02476.arrow"
+    text_key: "text"
+    characters_per_sample: 16384  # 2048 tokens × 8 chars/token (text-level lazy packing)
+  validation: null
+
+logger:
+  log_dir: "logs/single-teacher-llama8b-qwen3-14b-base-pkl"
+  num_val_samples_to_print: 5
+  wandb_enabled: true
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "x_token"
+    name: "single-teacher-llama8b-qwen3-14b-base-pkl"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
