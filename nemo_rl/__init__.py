@@ -36,6 +36,48 @@ megatron_path = (
 if megatron_path.exists() and str(megatron_path) not in sys.path:
     sys.path.append(str(megatron_path))
 
+
+def _patch_transformers_check_model_inputs() -> None:
+    """Work around an Automodel <-> transformers 5.5+ API mismatch.
+
+    transformers 5.5.0 (the earliest 5.x with gemma4) and every later 5.x have
+    `def check_model_inputs(func): ...` — a direct decorator. The vendored
+    Automodel at 3rdparty/Automodel-workspace/.../shared/import_utils.py:511
+    calls it as a no-arg factory (check_model_inputs()), which raises
+    `TypeError: missing 1 required positional argument: 'func'` and breaks
+    Automodel import for every Ray worker. Patch transformers' function so the
+    no-arg factory call returns the decorator itself, while keeping the
+    direct-decorator semantics intact. Idempotent and no-op when not needed.
+    """
+    try:
+        import inspect
+        import transformers.utils.generic as _gen
+    except ImportError:
+        return
+    cmi = getattr(_gen, "check_model_inputs", None)
+    if cmi is None or getattr(cmi, "__nrl_compat_patched__", False):
+        return
+    try:
+        params = inspect.signature(cmi).parameters
+    except (TypeError, ValueError):
+        return
+    func_param = params.get("func")
+    if func_param is None or func_param.default is not inspect.Parameter.empty:
+        return  # already optional-arg / factory-form; nothing to do
+
+    def _check_model_inputs_compat(func=None, *args, **kwargs):
+        # Automodel-style no-arg factory: return the original decorator.
+        if func is None:
+            return cmi
+        return cmi(func, *args, **kwargs)
+
+    _check_model_inputs_compat.__nrl_compat_patched__ = True  # type: ignore[attr-defined]
+    _gen.check_model_inputs = _check_model_inputs_compat
+
+
+_patch_transformers_check_model_inputs()
+
+
 from nemo_rl.package_info import (
     __contact_emails__,
     __contact_names__,

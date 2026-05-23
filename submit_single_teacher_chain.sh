@@ -95,9 +95,18 @@ COSINE_T_MAX=$(( MAX_STEPS - WARMUP_STEPS ))
 COMMAND=$(cat <<CMDEOF
 export HF_HOME=/lustre/fsw/portfolios/coreai/users/mingyyang/hf_cache
 export HF_TOKEN=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
+export HUGGINGFACE_HUB_TOKEN=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
 export WANDB_API_KEY=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
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
+# Ray workers run inside per-actor venvs baked into the container at
+# /opt/ray_venvs/. Those were built from an older pyproject.toml and ship
+# transformers without 'gemma4' in CONFIG_MAPPING. Force Ray to rebuild each
+# worker venv from the current pyproject.toml so the transformers==5.3.0
+# constraint actually lands inside the worker (otherwise teacher
+# DTensorPolicyWorkerV2 actors die with "KeyError: 'gemma4'").
+export NRL_FORCE_REBUILD_VENVS=true
+export NRL_IGNORE_VERSION_MISMATCH=1
 
 cd ${WORK_DIR}
 

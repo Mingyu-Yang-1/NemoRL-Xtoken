@@ -1,0 +1,197 @@
+# Single-teacher cross-tokenizer distillation: Llama-3.1-8B ← google/gemma-4-26B-A4B
+#
+# Same shape as single_teacher_cross_tokenizer_llama8b_qwen3_14b_arrow.yaml,
+# differences:
+#   - Teacher : google/gemma-4-26B-A4B (26B MoE, ~4B active, vocab=262144)
+#   - Loss    : P-KL (gold_loss=false, xtoken_loss=false)
+#   - Projection: Llama-3.1 (128256) → Gemma-4 tokenizer (262144), top-4
+#                 generated via tokenalign_upstream/minimal_projection_via_multitoken.py
+#                 (see /lustre/.../projection_llama8b_gemma4/llama_gemma4_best_special.pt)
+#
+# ⚠ PRE-RUN CHECKLIST FOR GEMMA-4:
+#   1. The container's transformers must be ≥ 5.x — model_type=gemma4 is not
+#      registered in transformers 4.x. The nemo_rl_0.6.0.sqsh container ships
+#      an older transformers; upgrade with `uv add 'transformers>=5.9.0'` or
+#      a one-shot pip install in the launcher.
+#   2. Gemma-4-26B-A4B weights (~52GB in bf16) are NOT yet in HF cache. The
+#      first job will download them; set HF_HUB_OFFLINE=0 for that run, or
+#      pre-stage with `huggingface-cli download google/gemma-4-26B-A4B`.
+#   3. Tokenizer-config has `extra_special_tokens` as a list (Gemma-4 schema);
+#      old transformers crash on this. transformers ≥ 5.0 handles it natively.
+#   4. The teacher's 262k vocab makes projected_full ≈ B·T·262144·4 bytes
+#      (≈ 4.3 GB for B=1, T=2048) — roughly 1.7× the Qwen3-32B case (151936).
+#      cpu_offload on the teacher should still fit, but profile early.
+#   5. Active params for MoE inference are ~4B but the teacher forward still
+#      materialises the full 26B for logits — keep cpu_offload=true.
+#
+# Steps   : 10000 (LinearLR warmup over 100 → CosineAnnealing T_max=9900 → 0)
+# Batch   : global=768 (1 seq/GPU × 256 GPUs on 32 nodes × 8 GPUs/node)
+
+distillation:
+  num_prompts_per_step: 768
+  max_num_steps: 10000
+  max_num_epochs: 100
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  projection_matrix_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/mingyyang/projection_llama8b_gemma4/llama_gemma4_best_special.pt"
+  gold_loss: false
+  xtoken_loss: false
+  temperature: 1.0
+  vocab_topk: 8192
+  uncommon_topk: 8192
+  reverse_kl: false
+  exact_token_match_only: false
+  project_teacher_to_student: false
+  kl_loss_weight: 1.0
+  ce_loss_scale: 0.1
+  dynamic_loss_scaling: true
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/single-teacher-llama8b-gemma4-26b-pkl"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 10
+  save_period: 100
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B"
+  tokenizer:
+    name: "meta-llama/Llama-3.1-8B"
+    chat_template: null
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 100
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 9900           # steps 101–10000
+        eta_min: 0.0
+    - milestones: [100]
+  generation: null
+
+teacher:
+  model_name: "google/gemma-4-26B-A4B"
+  tokenizer:
+    name: "google/gemma-4-26B-A4B"
+    chat_template: null
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    load_precision: "bfloat16"
+    shard_before_load: true
+    cpu_offload: true           # 26B MoE teacher — must offload
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  generation: null
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 4
+  train:
+    dataset_name: "arrow_text"
+    processor: "kd_data_processor"
+    arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00[0-9][0-9][0-9]-of-02476.arrow"
+    text_key: "text"
+    characters_per_sample: 16384
+  validation: null
+
+logger:
+  log_dir: "logs/single-teacher-llama8b-gemma4-26b-pkl"
+  num_val_samples_to_print: 5
+  wandb_enabled: true
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "x_token"
+    name: "single-teacher-llama8b-gemma4-26b-pkl"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
