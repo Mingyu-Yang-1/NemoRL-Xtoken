@@ -44,6 +44,7 @@ BATCH_SIZE=768
 TEACHER_LOAD_PRECISION="bfloat16"
 ARROW_FILES="/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-000[0-5][0-9]-of-02476.arrow"
 RUN_NAME=""
+EXTRA_OVERRIDES=""
 
 # ---- Parse named arguments ----
 while [[ $# -gt 0 ]]; do
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --teacher_load_precision) TEACHER_LOAD_PRECISION="$2"; shift 2 ;;
         --arrow_files)  ARROW_FILES="$2";  shift 2 ;;
         --run_name)     RUN_NAME="$2";     shift 2 ;;
+        --extra_overrides) EXTRA_OVERRIDES="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -126,7 +128,7 @@ uv run ${WORK_DIR}/examples/run_xtoken_distillation.py \
   logger.wandb.name=${RUN_NAME} \
   logger.log_dir=logs/${RUN_NAME} \
   checkpointing.enabled=true \
-  checkpointing.checkpoint_dir=checkpoints/${RUN_NAME}
+  checkpointing.checkpoint_dir=checkpoints/${RUN_NAME} ${EXTRA_OVERRIDES}
 CMDEOF
 )
 
