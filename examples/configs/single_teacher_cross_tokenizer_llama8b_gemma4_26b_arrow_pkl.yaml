@@ -49,6 +49,7 @@ loss_fn:
   kl_loss_weight: 1.0
   ce_loss_scale: 0.1
   dynamic_loss_scaling: true
+  kl_chunk_shift: true   # PT shift-by-1 convention; matches upstream xtoken_v1
 
 checkpointing:
   enabled: true
