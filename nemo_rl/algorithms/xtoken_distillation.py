@@ -221,6 +221,9 @@ def setup(
         ctx_length_teacher=teacher_config["max_total_sequence_length"],
         make_seq_div_by_student=policy_config["make_sequence_length_divisible_by"],
         make_seq_div_by_teacher=teacher_config["make_sequence_length_divisible_by"],
+        # Optional knobs: mode="chat" + add_eos_between_docs for SFT/chat data.
+        mode=data_config.get("collator_mode", "text"),
+        add_eos_between_docs=data_config.get("add_eos_between_docs", True),
     )
 
     # ==========================

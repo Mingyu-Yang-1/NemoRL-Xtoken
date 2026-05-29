@@ -1,0 +1,198 @@
+# Single-teacher cross-tokenizer distillation on SFT / chat data:
+# Llama-3.1-8B ← microsoft/phi-4 with H-KL loss.
+#
+# Differences vs the base-model H-KL config
+# (single_teacher_cross_tokenizer_llama8b_phi4_arrow_hkl.yaml):
+#
+#   - Data is chat-format (messages: [{role, content}, ...]) instead of
+#     raw text. Processor: chat_kd_processor.
+#   - Collator runs in mode=chat: applies each side's chat template with
+#     enable_thinking=false, tokenizes with return_offsets_mapping=true,
+#     builds a per-token assistant mask, then lockstep-packs the batch's
+#     conversations into one packed row per side (accept iff fits BOTH
+#     budgets). Assistant mask is multiplied into token_mask so the loss
+#     only fires on assistant-content tokens.
+#   - Alignment: offset_cluster_decode_fix (offset-based, per-document
+#     within the packed sequence). Required by chat-mode collator.
+#   - Sequence packing: ENABLED on the policy side so var-len attention
+#     keeps docs from attending across boundaries inside the packed row.
+#
+# Loss is the same H-KL as the base-model config.
+
+distillation:
+  num_prompts_per_step: 768       # candidate conversations per step (many
+                                  # will be packed into single rows)
+  max_num_steps: 10000
+  max_num_epochs: 100
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  projection_matrix_path: "/lustre/fsw/portfolios/coreai/users/mingyyang/xtoken_nemorl_v1/cross_tokenizer_data/projection_map_Llama-3.1_to_Phi-4_multitoken_top_4_special.pt"
+  gold_loss: true
+  xtoken_loss: true
+  temperature: 1.0
+  vocab_topk: 8192
+  uncommon_topk: 8192
+  reverse_kl: false
+  exact_token_match_only: false
+  project_teacher_to_student: false
+  kl_loss_weight: 1.0
+  ce_loss_scale: 0.1
+  dynamic_loss_scaling: false
+  kl_chunk_shift: true
+  # NEW: offset-based per-doc alignment (required by chat-mode collator).
+  alignment_method: "offset_cluster_decode_fix"
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/single-teacher-llama8b-phi4-chat-hkl"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"   # SFT student (instruct, has chat template)
+  tokenizer:
+    name: "meta-llama/Llama-3.1-8B-Instruct"
+    # chat_template left unset → use the model's default. The collator's
+    # chat-mode path calls apply_chat_template, which needs a template.
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096   # per-side packing budget; one packed
+                                    # row per __call__ holds many docs
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    sequence_length_round: 64
+  sequence_packing:
+    # IMPORTANT: keep this ON for chat mode so the model's attention is
+    # walled at packed doc boundaries (var-len attention with cu_seqlens).
+    # Without it, position 14 in Doc B's slice can attend to position 3 in
+    # Doc A's slice, contaminating Doc B's representation with Doc A.
+    enabled: true
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.0001
+        end_factor: 1.0
+        total_iters: 100
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 9900
+        eta_min: 1.0e-6
+    - milestones: [100]
+  generation: null
+
+teacher:
+  model_name: "microsoft/phi-4"
+  tokenizer:
+    name: "microsoft/phi-4"
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 4096
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    load_precision: "bfloat16"      # bf16 model load for the teacher
+    shard_before_load: true         # shard placements before weight materialization
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: 4096
+    logprob_mb_tokens: 4096
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  generation: null
+
+data:
+  max_input_seq_length: 4096
+  shuffle: true
+  num_workers: 4
+  # NEW: switch the collator into chat mode. With "text" (default), behavior
+  # is identical to the base-model arrow_text configs. With "chat", the
+  # collator does chat-template + assistant mask + lockstep packing.
+  collator_mode: "chat"
+  add_eos_between_docs: true
+  train:
+    # NOTE: the chat data source is intentionally unfilled — set this to
+    # your SFT dataset of choice. Any source that emits rows with a
+    # "messages" or "conversation" field works (chat_kd_processor handles
+    # both). Example HF datasets: "HuggingFaceH4/ultrachat_200k",
+    # "teknium/OpenHermes-2.5", or a local arrow shard.
+    dataset_name: "TODO_chat_dataset_name"
+    processor: "chat_kd_processor"
+    # arrow_files: "/path/to/your/chat/arrow/shards/*.arrow"
+    # text_key / characters_per_sample are NOT used in chat mode.
+  validation: null
+
+logger:
+  log_dir: "logs/single-teacher-llama8b-phi4-chat-hkl"
+  num_val_samples_to_print: 5
+  wandb_enabled: true
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "x_token"
+    name: "single-teacher-llama8b-phi4-chat-hkl"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32

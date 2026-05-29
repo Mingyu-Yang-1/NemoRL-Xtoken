@@ -807,6 +807,53 @@ def kd_data_processor(
     return output
 
 
+def chat_kd_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer: TokenizerType,
+    max_seq_length: int | None,
+    idx: int,
+) -> DatumSpec:
+    """Process a chat/SFT datum for cross-tokenizer distillation.
+
+    Mirrors :func:`kd_data_processor` but carries a ``messages`` list
+    instead of raw text. The cross-tokenizer collator's ``mode="chat"``
+    path consumes ``messages`` directly — it applies each side's chat
+    template, tokenizes with ``return_offsets_mapping=True``, builds
+    per-token assistant masks, and lockstep-packs the batch.
+
+    Accepts either schema:
+      - ``datum_dict["messages"]`` already in HF format
+        (``[{"role": "...", "content": "..."}]``)
+      - ``datum_dict["conversation"]`` (alias used by some chat datasets)
+    """
+    if "messages" in datum_dict:
+        messages = datum_dict["messages"]
+    elif "conversation" in datum_dict:
+        messages = datum_dict["conversation"]
+    else:
+        raise KeyError(
+            "chat_kd_processor: expected 'messages' or 'conversation' in "
+            f"datum_dict, got keys {list(datum_dict.keys())}"
+        )
+
+    # Total character count — bookkeeping for dataloader-level batching
+    # heuristics; the collator does its own packing.
+    length = sum(len((m or {}).get("content") or "") for m in messages)
+
+    output: DatumSpec = {
+        "message_log": [],
+        "length": length,
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+        "messages": messages,  # consumed by CrossTokenizerCollator (chat mode)
+    }
+    if "task_name" in datum_dict:
+        output["task_name"] = datum_dict["task_name"]
+    return output
+
+
 # Processor registry. Key is the processor name, value is the processor function.
 # Note: We cast the literal dict to Dict[str, TaskDataProcessFnCallable] because
 # type checkers see each concrete function's signature as a distinct callable type.
@@ -819,6 +866,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "default": math_hf_data_processor,
         "helpsteer3_data_processor": helpsteer3_data_processor,
         "kd_data_processor": kd_data_processor,
+        "chat_kd_processor": chat_kd_processor,
         "math_data_processor": math_data_processor,
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
