@@ -151,17 +151,34 @@ class TokenAligner:
             on one side against multiple tokens on the other.
     """
 
+    # Supported alignment methods. Adding a new method requires:
+    #   1. A branch in :meth:`align` that produces the same 7-tuple shape
+    #      as ``_align_single``.
+    #   2. (Optional) carrying offsets through; see the offset_cluster branch.
+    _SUPPORTED_ALIGNMENT_METHODS = (
+        "dp_decode_fix",
+        "offset_cluster_decode_fix",
+    )
+
     def __init__(
         self,
         student_tokenizer,
         teacher_tokenizer,
         projection_matrix_path: str,
         max_comb_len: int = 4,
+        alignment_method: str = "dp_decode_fix",
     ):
+        if alignment_method not in self._SUPPORTED_ALIGNMENT_METHODS:
+            raise ValueError(
+                f"alignment_method must be one of "
+                f"{self._SUPPORTED_ALIGNMENT_METHODS!r}, got "
+                f"{alignment_method!r}"
+            )
         self.student_tokenizer = student_tokenizer
         self.teacher_tokenizer = teacher_tokenizer
         self.max_combination_len = max_comb_len
         self.projection_matrix_path = projection_matrix_path
+        self.alignment_method = alignment_method
 
         # Loaded lazily by load_projection_matrix(); the loss fn calls that
         # explicitly on its training device. We store the raw COO components
@@ -269,12 +286,21 @@ class TokenAligner:
         self,
         student_ids: torch.Tensor,
         teacher_ids: torch.Tensor,
+        *,
+        student_offsets: List[List[Tuple[int, int]]] | None = None,
+        teacher_offsets: List[List[Tuple[int, int]]] | None = None,
     ) -> AlignmentBatch:
         """Align a batch of student/teacher token id tensors.
 
         Args:
             student_ids: ``[B, T_s]`` long tensor.
             teacher_ids: ``[B, T_t]`` long tensor.
+            student_offsets: required when
+                ``alignment_method == "offset_cluster_decode_fix"``. Per-sample
+                list of ``(cs, ce)`` tuples from a fast HF tokenizer with
+                ``return_offsets_mapping=True``. Outer length must be ``B``,
+                inner length must equal ``T_s``.
+            teacher_offsets: same shape on the teacher side.
 
         Returns:
             An :class:`AlignmentBatch` with all fields populated for the
@@ -288,32 +314,121 @@ class TokenAligner:
         b, t_s = student_ids.shape
         _, t_t = teacher_ids.shape
 
-        student_token_lists: List[List[str]] = [
-            self.student_tokenizer.convert_ids_to_tokens(student_ids[i].tolist())
-            for i in range(b)
-        ]
-        teacher_token_lists: List[List[str]] = [
-            self.teacher_tokenizer.convert_ids_to_tokens(teacher_ids[i].tolist())
-            for i in range(b)
-        ]
-
-        per_sample_pairs: List[List[Tuple[Any, ...]]] = []
-        for i, (s_toks, t_toks) in enumerate(
-            zip(student_token_lists, teacher_token_lists)
-        ):
-            # Pass original token-ID lists + tokenizers so _alignment_mask can
-            # fall back to NFC-normalised decoded text when canonical-string
-            # compare misses (CJK byte-encoding diffs, whitespace-split
-            # asymmetry between e.g. SentencePiece ▁ and GPT-2 Ġ).
-            pairs = self._align_single(
-                s_toks,
-                t_toks,
-                student_ids_seq=student_ids[i].tolist(),
-                teacher_ids_seq=teacher_ids[i].tolist(),
+        if self.alignment_method == "offset_cluster_decode_fix":
+            if student_offsets is None or teacher_offsets is None:
+                raise ValueError(
+                    "alignment_method=offset_cluster_decode_fix requires "
+                    "student_offsets and teacher_offsets (tokenize with "
+                    "return_offsets_mapping=True on a fast HF tokenizer)."
+                )
+            per_sample_pairs = self._align_batch_offset_cluster(
+                student_ids, teacher_ids, student_offsets, teacher_offsets
             )
-            per_sample_pairs.append(pairs)
+        else:  # dp_decode_fix (default)
+            student_token_lists: List[List[str]] = [
+                self.student_tokenizer.convert_ids_to_tokens(
+                    student_ids[i].tolist()
+                )
+                for i in range(b)
+            ]
+            teacher_token_lists: List[List[str]] = [
+                self.teacher_tokenizer.convert_ids_to_tokens(
+                    teacher_ids[i].tolist()
+                )
+                for i in range(b)
+            ]
+            per_sample_pairs = []
+            for i, (s_toks, t_toks) in enumerate(
+                zip(student_token_lists, teacher_token_lists)
+            ):
+                # Pass original token-ID lists + tokenizers so _alignment_mask
+                # can fall back to NFC-normalised decoded text when canonical-
+                # string compare misses (CJK byte-encoding diffs, whitespace-
+                # split asymmetry between e.g. SentencePiece ▁ and GPT-2 Ġ).
+                pairs = self._align_single(
+                    s_toks,
+                    t_toks,
+                    student_ids_seq=student_ids[i].tolist(),
+                    teacher_ids_seq=teacher_ids[i].tolist(),
+                )
+                per_sample_pairs.append(pairs)
 
         return self._pairs_to_batch(per_sample_pairs, b=b, t_s=t_s, t_t=t_t)
+
+    def align_one_offset(
+        self,
+        student_ids: List[int],
+        teacher_ids: List[int],
+        student_offsets: List[Tuple[int, int]],
+        teacher_offsets: List[Tuple[int, int]],
+    ) -> List[Tuple[Any, ...]]:
+        """Single-sample offset_cluster_decode_fix alignment.
+
+        Returns the raw 7-tuple pair list (same format the DP path uses
+        internally). Used directly by the chat collator for per-document
+        alignment inside a packed batch row.
+
+        Combines :func:`offset_alignment.align_by_offsets_cluster` with the
+        decode-NFC fallback in :func:`_alignment_mask`. This matches
+        upstream's ``offset_cluster_decode_fix`` semantics: default
+        offset_cluster marks is_correct=True on every paired (non-orphan)
+        group; the decode-fix path downgrades pairs whose canonicals don't
+        match AND whose decoded NFC text also doesn't match.
+        """
+        from nemo_rl.algorithms.x_token.offset_alignment import (
+            align_by_offsets_cluster,
+        )
+
+        pairs = align_by_offsets_cluster(
+            student_ids,
+            student_offsets,
+            self.student_tokenizer,
+            teacher_ids,
+            teacher_offsets,
+            self.teacher_tokenizer,
+        )
+        # decode-fix recompute: re-derive is_correct via the same
+        # canonical+NFC-decode mask used in the DP path.
+        if pairs:
+            pairs_6 = [(p[0], p[1], p[2], p[3], p[4], p[5]) for p in pairs]
+            mask = _alignment_mask(
+                pairs_6,
+                student_ids_seq=student_ids,
+                teacher_ids_seq=teacher_ids,
+                student_tokenizer=self.student_tokenizer,
+                teacher_tokenizer=self.teacher_tokenizer,
+            )
+            pairs = [
+                (p[0], p[1], p[2], p[3], p[4], p[5], m)
+                for p, m in zip(pairs_6, mask)
+            ]
+        return pairs
+
+    def _align_batch_offset_cluster(
+        self,
+        student_ids: torch.Tensor,
+        teacher_ids: torch.Tensor,
+        student_offsets: List[List[Tuple[int, int]]],
+        teacher_offsets: List[List[Tuple[int, int]]],
+    ) -> List[List[Tuple[Any, ...]]]:
+        """Per-sample offset_cluster_decode_fix alignment over a tensor batch.
+
+        Thin loop over :meth:`align_one_offset`.
+        """
+        b = student_ids.shape[0]
+        assert len(student_offsets) == b and len(teacher_offsets) == b, (
+            f"offset list length {len(student_offsets)}/{len(teacher_offsets)}"
+            f" does not match batch size {b}"
+        )
+        return [
+            self.align_one_offset(
+                student_ids[i].tolist(),
+                teacher_ids[i].tolist(),
+                student_offsets[i],
+                teacher_offsets[i],
+            )
+            for i in range(b)
+        ]
 
     @staticmethod
     def _pairs_to_batch(

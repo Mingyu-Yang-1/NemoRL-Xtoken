@@ -209,6 +209,8 @@ def setup(
         student_tokenizer=student_tokenizer,
         teacher_tokenizer=teacher_tokenizer,
         projection_matrix_path=loss_config["projection_matrix_path"],
+        # Optional knob: "dp_decode_fix" (default) or "offset_cluster_decode_fix".
+        alignment_method=loss_config.get("alignment_method", "dp_decode_fix"),
     )
 
     collator = CrossTokenizerCollator(
