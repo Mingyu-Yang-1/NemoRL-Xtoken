@@ -6,12 +6,21 @@
 #
 #   - Data is chat-format (messages: [{role, content}, ...]) instead of
 #     raw text. Processor: chat_kd_processor.
-#   - Collator runs in mode=chat: applies each side's chat template with
-#     enable_thinking=false, tokenizes with return_offsets_mapping=true,
-#     builds a per-token assistant mask, then lockstep-packs the batch's
-#     conversations into one packed row per side (accept iff fits BOTH
-#     budgets). Assistant mask is multiplied into token_mask so the loss
-#     only fires on assistant-content tokens.
+#   - Collator runs in mode=chat. Per Pavlo's design for cross-tokenizer
+#     chat data: the STUDENT renders its chat template (enable_thinking=
+#     false), and the TEACHER tokenizes that SAME student-rendered text
+#     (not its own template). Both sides' offsets thus live in one
+#     character coordinate system, which is what makes
+#     offset_cluster_decode_fix produce meaningful cross-side pairs.
+#     Trade-off: the teacher sees Llama-format scaffold (special-token
+#     strings broken into sub-tokens by its BPE) instead of its native
+#     chat scaffolding. KL extraction still works in practice — the
+#     teacher produces a probability distribution we can target — but
+#     teacher activations are slightly out-of-distribution on scaffold
+#     positions. Loss only supervises assistant-content tokens (via
+#     assistant_mask), so the scaffold positions don't drive learning.
+#   - Conversations are lockstep-packed into one row per side (accept
+#     iff fits BOTH student and teacher budgets).
 #   - Alignment: offset_cluster_decode_fix (offset-based, per-document
 #     within the packed sequence). Required by chat-mode collator.
 #   - Sequence packing: ENABLED on the policy side so var-len attention

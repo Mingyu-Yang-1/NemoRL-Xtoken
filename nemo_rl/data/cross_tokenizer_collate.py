@@ -185,20 +185,37 @@ class CrossTokenizerCollator:
     # chat-mode (SFT/instruct): lockstep packing + per-doc alignment
     # ------------------------------------------------------------------ #
     def _call_chat(self, batch: List[DatumSpec]) -> BatchedDataDict[Any]:
-        # Per-doc tokenization with assistant masks + offsets, both sides.
+        # Pavlo's design for cross-tokenizer chat: render once on the
+        # STUDENT side, then tokenize that same rendered text with the
+        # teacher tokenizer too. Both sides' offsets then live in the same
+        # character coordinate system, which is what makes
+        # offset_cluster_decode_fix produce meaningful cross-side pairs.
+        # Trade-off: the teacher sees Llama-format scaffold (special token
+        # strings broken into sub-tokens by its BPE) instead of its own
+        # native chat scaffolding. For KL extraction this works in
+        # practice; the teacher still produces a probability distribution
+        # we can target.
         messages_list = [datum[self.messages_key] for datum in batch]
-        per_doc_student = [
-            _apply_chat_template_with_assistant_mask(
-                self.student_tokenizer, m, self.ctx_length_student
+
+        per_doc_student: List[Dict[str, Any] | None] = []
+        per_doc_teacher: List[Dict[str, Any] | None] = []
+        for m in messages_list:
+            student_text, s_tok = _render_student_and_tokenize(
+                self.student_tokenizer, m, self.ctx_length_student,
             )
-            for m in messages_list
-        ]
-        per_doc_teacher = [
-            _apply_chat_template_with_assistant_mask(
-                self.teacher_tokenizer, m, self.ctx_length_teacher
+            if student_text is None:
+                per_doc_student.append(None)
+                per_doc_teacher.append(None)
+                continue
+            # Teacher tokenizes the SAME student-rendered text — NOT its
+            # own template render. Offsets land in student_text's space.
+            t_tok = _tokenize_text_with_assistant_mask(
+                self.teacher_tokenizer, student_text, m,
+                self.ctx_length_teacher,
             )
-            for m in messages_list
-        ]
+            per_doc_student.append(s_tok)
+            per_doc_teacher.append(t_tok)
+
         # Drop rows that failed to tokenize on either side.
         keep = [
             i for i in range(len(messages_list))
@@ -409,44 +426,63 @@ class CrossTokenizerCollator:
 # ---------------------------------------------------------------------------
 # Chat-mode helpers (module-level so they're picklable across DataLoader workers)
 # ---------------------------------------------------------------------------
-def _apply_chat_template_with_assistant_mask(
+def _render_chat_text(
     tokenizer: PreTrainedTokenizerBase,
     messages: List[Dict[str, str]],
-    max_len: int,
-) -> Dict[str, Any] | None:
-    """Tokenize one conversation with chat template + per-token assistant mask.
+) -> str | None:
+    """Render the chat template to a single text string (no tokenization).
 
-    Adapted from ``tokenalign_pavlo/src/pytorch_data_loader.py
-    ::_apply_chat_template_with_assistant_mask``. Differences:
-
-    * Returns offsets along with ids/mask (needed for
-      ``offset_cluster_decode_fix`` alignment downstream).
-    * **Left-truncates** so the assistant response at the tail is preserved.
-      Right-truncation (HF default) drops the tail; for long conversations
-      that wipes the assistant content, leaving an all-zero assistant_mask
-      which then NaNs the loss (division by zero in CE/KL valid-count).
-    * Drops ``<think>...</think>`` sub-spans within assistant content so the
-      non-thinking-mode loss supervises only the final answer.
-
-    Returns ``None`` when the chat template fails (template-less tokenizer,
-    malformed messages, etc.) so the caller can skip the row cleanly.
+    Returns ``None`` when the template fails so the caller can skip the row.
+    Uses ``enable_thinking=False`` when the template supports it.
     """
     try:
         try:
-            text = tokenizer.apply_chat_template(
+            return tokenizer.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=False,
                 enable_thinking=False,
             )
         except TypeError:
-            # Older / templates without enable_thinking kwarg.
-            text = tokenizer.apply_chat_template(
+            return tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False,
             )
     except Exception:
         return None
 
+
+def _tokenize_text_with_assistant_mask(
+    tokenizer: PreTrainedTokenizerBase,
+    text: str,
+    messages: List[Dict[str, str]],
+    max_len: int,
+) -> Dict[str, Any] | None:
+    """Tokenize a pre-rendered text and build a per-token assistant mask.
+
+    Used by both sides of the chat-mode collator. The student calls this
+    with its own rendered text; the teacher calls it with the **student's**
+    rendered text (Pavlo's design — see :meth:`CrossTokenizerCollator._call_chat`)
+    so both sides' offsets live in the same character coordinate system.
+    That's what makes ``offset_cluster_decode_fix`` produce meaningful
+    cross-side pairs on chat data.
+
+    Important:
+      * ``add_special_tokens=False`` — the rendered text already contains
+        the student's special tokens as literal strings (e.g.
+        ``<|begin_of_text|>``); we don't want the tokenizer to prepend its
+        OWN BOS/EOS on top. For the teacher side, the teacher's BPE will
+        break the student's special-token strings into sub-tokens, which
+        is the explicit cost of this design.
+      * **Left-truncation** so the assistant response at the tail is
+        preserved. Right-truncation (HF default) drops the tail; for long
+        conversations that wipes the assistant content, leaving an
+        all-zero assistant_mask which then NaNs the loss.
+      * ``<think>...</think>`` sub-spans inside assistant content are
+        excluded from the mask (non-thinking-mode supervision).
+
+    Returns ``None`` when no assistant content survives (e.g. left-trunc
+    cut just past the assistant span); the caller can skip the row.
+    """
     prev_side = getattr(tokenizer, "truncation_side", "right")
     tokenizer.truncation_side = "left"
     try:
@@ -496,9 +532,6 @@ def _apply_chat_template_with_assistant_mask(
                     mask[i] = 1
 
     if not any(mask):
-        # No assistant content survived (e.g. template wiped the role or
-        # left-trunc cut just past the assistant span). Skip — otherwise
-        # this doc contributes zero loss and only consumes the budget.
         return None
 
     return {
@@ -506,6 +539,26 @@ def _apply_chat_template_with_assistant_mask(
         "offsets": [tuple(o) for o in offsets],
         "asst_mask": mask,
     }
+
+
+def _render_student_and_tokenize(
+    tokenizer: PreTrainedTokenizerBase,
+    messages: List[Dict[str, str]],
+    max_len: int,
+) -> Tuple[str, Dict[str, Any]] | Tuple[None, None]:
+    """Convenience wrapper: render student chat template + tokenize.
+
+    Returns ``(rendered_text, tokenization_dict)`` so the caller can feed
+    the same ``rendered_text`` into the teacher tokenizer for coordinate-
+    system parity. Returns ``(None, None)`` when either step fails.
+    """
+    text = _render_chat_text(tokenizer, messages)
+    if text is None:
+        return None, None
+    tok = _tokenize_text_with_assistant_mask(tokenizer, text, messages, max_len)
+    if tok is None:
+        return None, None
+    return text, tok
 
 
 def _pack_lockstep(
