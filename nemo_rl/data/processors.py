@@ -187,6 +187,77 @@ def sft_processor(
     return output
 
 
+def arrow_text_sft_processor(
+    datum_dict: dict[str, Any],
+    task_data_spec: TaskDataSpec,
+    tokenizer,
+    max_seq_length: int,
+    idx: int,
+    add_bos: bool = True,
+    add_eos: bool = True,
+    add_generation_prompt: bool = False,
+) -> DatumSpec:
+    """SFT processor for ArrowTextDataset's lazy-packed samples.
+
+    Unlike `sft_processor`, this is designed for inputs that are *deliberately*
+    over-packed to ~max_seq_length tokens (see ArrowTextDataset docstring on
+    `characters_per_sample`). It truncates each sample's token sequence down
+    to `max_seq_length` and KEEPS loss_multiplier = 1.0, so the loss is
+    computed on the full context-length window of every sample.
+
+    The default `sft_processor` would treat such samples as pathological and
+    zero out their loss, which silently produces num_valid_samples=0 across
+    the whole batch.
+
+    Accepts either schema:
+      - v1-style: ``datum_dict["messages"] = [{"role": "assistant", "content": ...}]``
+      - this-repo: ``datum_dict["text"] = <packed string>`` (the cross-tokenizer
+        ArrowTextDataset emits this; we wrap it as a single assistant message).
+    """
+    if "messages" in datum_dict:
+        messages = datum_dict["messages"]
+    elif "text" in datum_dict:
+        messages = [{"role": "assistant", "content": datum_dict["text"]}]
+    else:
+        raise KeyError(
+            f"arrow_text_sft_processor: expected 'messages' or 'text' in datum_dict, "
+            f"got keys {list(datum_dict.keys())}"
+        )
+    message_log = get_formatted_message_log(
+        messages,
+        tokenizer,
+        task_data_spec,
+        add_bos_token=add_bos,
+        add_eos_token=add_eos,
+        add_generation_prompt=add_generation_prompt,
+        tools=datum_dict.get("tools", None),
+    )
+
+    length = sum(len(m["token_ids"]) for m in message_log)
+
+    # Truncate from the end across the concatenated token sequence so the
+    # total length is exactly max_seq_length. For arrow_text we typically
+    # have a single assistant message; the loop handles the general case.
+    if length > max_seq_length:
+        remaining = max_seq_length
+        for message in message_log:
+            n = len(message["token_ids"])
+            if n <= remaining:
+                remaining -= n
+            else:
+                message["token_ids"] = message["token_ids"][:remaining]
+                remaining = 0
+        length = max_seq_length
+
+    return {
+        "message_log": message_log,
+        "length": length,
+        "extra_env_info": None,
+        "loss_multiplier": 1.0,
+        "idx": idx,
+    }
+
+
 def preference_preprocessor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -752,6 +823,7 @@ PROCESSOR_REGISTRY: Dict[str, TaskDataProcessFnCallable] = cast(
         "math_hf_data_processor": math_hf_data_processor,
         "multichoice_qa_processor": multichoice_qa_processor,
         "sft_processor": sft_processor,
+        "arrow_text_sft_processor": arrow_text_sft_processor,
         "vlm_hf_data_processor": vlm_hf_data_processor,
         "nemo_gym_data_processor": nemo_gym_data_processor,
     },

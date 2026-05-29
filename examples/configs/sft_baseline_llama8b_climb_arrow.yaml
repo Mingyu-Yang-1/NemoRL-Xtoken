@@ -1,0 +1,161 @@
+# CE-only SFT baseline for the cross-tokenizer distillation experiments.
+#
+# Mirrors the data + tokenization pipeline of
+#   examples/configs/single_teacher_cross_tokenizer_llama8b_qwen3_32b_arrow.yaml
+# (and the 14B variant) so that the student sees byte-identical token
+# sequences at every step. The only differences vs. the distillation run:
+#   - no teacher, no projection matrix, no KL term
+#   - SFT entrypoint with NLLLossFn (pure next-token-prediction CE)
+#
+# Token-level parity is achieved via:
+#   - same dataset (arrow_text + same arrow_files glob)
+#   - same lazy-packing target (characters_per_sample: 16384)
+#   - same student tokenizer (Llama-3.1-8B)
+#   - chat_template: null  (passthrough — no role headers, no special prefixes)
+#   - add_bos / add_eos / add_generation_prompt match distillation defaults
+#   - same max_total_sequence_length truncation
+#   - same seed and same DP world shape (32 nodes × 8 GPUs)
+#   - same train_global_batch_size (768)
+#
+# Training schedule and hyperparameters mirror the distillation run so the
+# only training-side delta is the loss function.
+
+sft:
+  max_num_epochs: 100
+  max_num_steps: 10000
+  val_period: 0
+  val_batches: 0
+  val_global_batch_size: 8
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: "checkpoints/sft-baseline-llama8b-climb"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B"
+  tokenizer:
+    name: "meta-llama/Llama-3.1-8B"
+    chat_template: null              # ← passthrough; identical to distillation run
+    chat_template_kwargs: null
+  train_global_batch_size: 768
+  train_micro_batch_size: 1
+  max_total_sequence_length: 2048
+  precision: "bfloat16"
+
+  offload_optimizer_for_logprob: true
+
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    env_vars: {}
+    cpu_offload: false
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+    automodel_kwargs: {}
+    lora_cfg:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      match_all_linear: true
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init: "xavier"
+      use_triton: true
+
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    sequence_length_round: 64
+
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+
+  make_sequence_length_divisible_by: 1
+  max_grad_norm: 1.0
+
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.02
+        end_factor: 1.0
+        total_iters: 100
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 9900             # steps 101–10000
+        eta_min: 0.0
+    - milestones: [100]
+
+  megatron_cfg:
+    enabled: false
+
+data:
+  max_input_seq_length: 2048
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 4
+
+  train:
+    dataset_name: "arrow_text"
+    arrow_files: "/lustre/fsw/portfolios/llmservice/users/sdiao/data/climb_nm5.5_phase3_400b_shuffled_text_only_global_shuffle/data-00[0-9][0-9][0-9]-of-02476.arrow"
+    text_key: "text"
+    characters_per_sample: 16384   # 2048 tokens × 8 chars/token — matches distillation packing
+    val_split: 0.0                 # no validation split
+  validation: null
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    # Use the arrow_text variant: keeps loss_multiplier=1.0 on truncation
+    # since ArrowTextDataset deliberately over-packs to ~max_seq_length tokens.
+    # Default sft_processor would zero loss_multiplier on every sample and
+    # leave all_mb_metrics empty.
+    processor: "arrow_text_sft_processor"
+
+logger:
+  log_dir: "logs/sft-baseline-llama8b-climb"
+  wandb_enabled: true
+  tensorboard_enabled: false
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: "x_token"
+    name: "sft-baseline-llama8b-climb"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
