@@ -1,0 +1,187 @@
+# SMOKE-TEST config for SFT chat distillation: Llama-3.1-8B-Instruct ← phi-4.
+# Tiny: 1 node, 10 steps, ctx=1024 per side. Used to validate the
+# end-to-end pipeline (collator + per-doc alignment + sequence_packing
+# + loss + optimizer step) lights up without NaN.
+#
+# Not for real training — see single_teacher_cross_tokenizer_llama8b_phi4_chat_hkl.yaml
+# for the full-scale 32-node H-KL chat distillation.
+
+distillation:
+  num_prompts_per_step: 8
+  max_num_steps: 10
+  max_num_epochs: 1
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+loss_fn:
+  projection_matrix_path: "/lustre/fsw/portfolios/coreai/users/mingyyang/xtoken_nemorl_v1/cross_tokenizer_data/projection_map_Llama-3.1_to_Phi-4_multitoken_top_4_special.pt"
+  gold_loss: true
+  xtoken_loss: true
+  temperature: 1.0
+  vocab_topk: 8192
+  uncommon_topk: 8192
+  reverse_kl: false
+  exact_token_match_only: false
+  project_teacher_to_student: false
+  kl_loss_weight: 1.0
+  ce_loss_scale: 0.1
+  dynamic_loss_scaling: false
+  kl_chunk_shift: true
+  alignment_method: "offset_cluster_decode_fix"
+
+checkpointing:
+  enabled: false                  # smoke: no ckpts written
+  checkpoint_dir: "checkpoints/smoke-chat-distill"
+  metric_name: "train:loss"
+  higher_is_better: false
+  keep_top_k: 1
+  save_period: 100
+  checkpoint_must_save_by: null
+  save_optimizer: true
+  model_save_format: "safetensors"
+  save_consolidated: false
+
+policy:
+  model_name: "meta-llama/Llama-3.1-8B-Instruct"
+  tokenizer:
+    name: "meta-llama/Llama-3.1-8B-Instruct"
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048   # bumped from 1024 — cascade-2 chat
+                                    # often exceeds 1024 tokens, causing
+                                    # docs to be dropped and rows to be
+                                    # empty (all-zero token_mask → loss=0
+                                    # → no autograd graph → backward fails)
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    # Keep this OFF for the smoke. With only 1 doc packed per row
+    # (cascade-2 chat is long-ish at ctx=1024), the doc-isolation
+    # benefit is moot here, and turning it on would require wiring
+    # student_doc_id into the policy worker's cu_seqlens path —
+    # untested. Verify the easier path works first.
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 5.0e-5
+      weight_decay: 0.001
+      betas: [0.9, 0.95]
+      eps: 1e-8
+      foreach: false
+      fused: false
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.0001
+        end_factor: 1.0
+        total_iters: 2
+    - name: "torch.optim.lr_scheduler.CosineAnnealingLR"
+      kwargs:
+        T_max: 8
+        eta_min: 1.0e-6
+    - milestones: [2]
+  generation: null
+
+teacher:
+  model_name: "microsoft/phi-4"
+  tokenizer:
+    name: "microsoft/phi-4"
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048   # match policy.max_total_sequence_length
+  make_sequence_length_divisible_by: 1
+  precision: "bfloat16"
+  logprob_chunk_size: null
+  offload_optimizer_for_logprob: true
+  dtensor_cfg:
+    enabled: true
+    _v2: true
+    load_precision: "bfloat16"
+    shard_before_load: true
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 1
+    context_parallel_size: 1
+    custom_parallel_plan: null
+  max_grad_norm: 1.0
+  dynamic_batching:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+    train_mb_tokens: 2048
+    logprob_mb_tokens: 2048
+    algorithm: "modified_first_fit_decreasing"
+    sequence_length_round: 64
+  generation: null
+
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  num_workers: 2
+  collator_mode: "chat"
+  add_eos_between_docs: true
+  # The chat collator emits B=num_packed_rows rows per __call__. Must be
+  # ≥ dp_size so the trainer's shard_by_batch_size divides cleanly.
+  # Smoke uses 8 GPUs / DP=8, so emit 8 rows. Each row gets ceil(num_prompts/8)
+  # candidates lockstep-packed together.
+  num_packed_rows: 8
+  train:
+    dataset_name: "Nemotron-Cascade-2-SFT"
+    subset: "chat"
+    processor: "chat_kd_processor"
+    max_samples: 100              # tiny — just need enough to feed 10 steps
+    split_validation_size: 0.0
+  validation: null
+
+logger:
+  log_dir: "logs/smoke-chat-distill"
+  num_val_samples_to_print: 0
+  wandb_enabled: false             # smoke: skip wandb (submit script overrides to true)
+  swanlab_enabled: false
+  mlflow_enabled: false
+  tensorboard_enabled: false
+  monitor_gpus: false
+  wandb:                            # required for submit_single_teacher_chain.sh's
+    project: "x_token"              # logger.wandb.name=... override
+    name: "smoke-chat-distill"
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  # 8 GPUs / DP=8. The chat collator emits num_packed_rows=8 rows per
+  # __call__ (see data block) so shard_by_batch_size(dp_size=8) divides
+  # cleanly. Same shape as a real production training run, just at the
+  # smallest cluster scale.
+  gpus_per_node: 8
+  num_nodes: 1

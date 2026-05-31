@@ -96,6 +96,13 @@ class CrossTokenizerCollator:
             ``chat`` mode. Default ``"messages"``.
         add_eos_between_docs: Append the per-side EOS token between packed
             documents. Default True; matches Pavlo's reference behavior.
+        num_packed_rows: In ``chat`` mode, the number of packed rows to
+            emit per ``__call__`` (output batch dim B = ``num_packed_rows``).
+            Must be ≥ the data-parallel world size so the trainer's
+            ``shard_by_batch_size(dp_size)`` divides cleanly. Default 1.
+            The collator chunks the input batch's candidate conversations
+            into ``num_packed_rows`` groups (chunked, not round-robin)
+            and lockstep-packs each group into its own row independently.
     """
 
     def __init__(
@@ -112,6 +119,7 @@ class CrossTokenizerCollator:
         mode: str = "text",
         messages_key: str = "messages",
         add_eos_between_docs: bool = True,
+        num_packed_rows: int = 1,
     ):
         if mode not in ("text", "chat"):
             raise ValueError(f"mode must be 'text' or 'chat', got {mode!r}")
@@ -121,6 +129,10 @@ class CrossTokenizerCollator:
                 "alignment_method='offset_cluster_decode_fix' (chat mode "
                 "tokenizes with return_offsets_mapping=True and aligns "
                 "per-document using char offsets)."
+            )
+        if num_packed_rows < 1:
+            raise ValueError(
+                f"num_packed_rows must be ≥ 1, got {num_packed_rows}"
             )
 
         self.student_tokenizer = student_tokenizer
@@ -134,6 +146,7 @@ class CrossTokenizerCollator:
         self.mode = mode
         self.messages_key = messages_key
         self.add_eos_between_docs = add_eos_between_docs
+        self.num_packed_rows = num_packed_rows
         # Defensive: HF tokenizers without a pad token can't pad batches.
         if self.student_tokenizer.pad_token_id is None:
             self.student_tokenizer.pad_token = self.student_tokenizer.eos_token
@@ -199,13 +212,12 @@ class CrossTokenizerCollator:
 
         per_doc_student: List[Dict[str, Any] | None] = []
         per_doc_teacher: List[Dict[str, Any] | None] = []
-        for m in messages_list:
+        per_doc_idx: List[int] = []
+        for i, m in enumerate(messages_list):
             student_text, s_tok = _render_student_and_tokenize(
                 self.student_tokenizer, m, self.ctx_length_student,
             )
             if student_text is None:
-                per_doc_student.append(None)
-                per_doc_teacher.append(None)
                 continue
             # Teacher tokenizes the SAME student-rendered text — NOT its
             # own template render. Offsets land in student_text's space.
@@ -213,70 +225,128 @@ class CrossTokenizerCollator:
                 self.teacher_tokenizer, student_text, m,
                 self.ctx_length_teacher,
             )
+            if t_tok is None:
+                continue
             per_doc_student.append(s_tok)
             per_doc_teacher.append(t_tok)
+            per_doc_idx.append(batch[i]["idx"])
 
-        # Drop rows that failed to tokenize on either side.
-        keep = [
-            i for i in range(len(messages_list))
-            if per_doc_student[i] is not None and per_doc_teacher[i] is not None
-        ]
+        # Split surviving candidates into num_packed_rows groups
+        # (contiguous chunks; first row gets the first ceil(K/N) docs,
+        # etc.). Chunked beats round-robin because adjacent samples in a
+        # shuffled dataloader are independent — there's no locality to
+        # preserve, but chunked keeps the per-row doc count balanced.
+        #
+        # TODO (empty-row backward bug): when chunk_size=1 and some
+        # candidates don't fit ctx_length, rows assigned those candidates
+        # come out with sample_mask=0 / token_mask=0. Under FSDP/DDP with
+        # dp_size>1, ranks whose row is empty have no autograd graph
+        # to backprop through, and the loss tensor materializes as a
+        # graph-detached zero → backward() raises ``RuntimeError: element
+        # 0 of tensors does not require grad and does not have a grad_fn``.
+        # Fix needs either: (a) greedy-refill so no row is empty (pull
+        # from non-empty neighbors when a chunk is empty), or (b) make
+        # the trainer/loss handle all-zero token_mask rows gracefully
+        # (skip the iteration on the rank, or replicate a non-empty
+        # row's gradient contribution to keep ranks in lockstep).
+        N = self.num_packed_rows
+        K = len(per_doc_student)
+        if K == 0:
+            row_chunks: List[Tuple[List[int], List[int]]] = [
+                ([], []) for _ in range(N)
+            ]
+        else:
+            chunk = max(1, (K + N - 1) // N)
+            row_chunks = []
+            for r in range(N):
+                start = r * chunk
+                end = min(start + chunk, K)
+                if start >= K:
+                    row_chunks.append(([], []))
+                else:
+                    row_chunks.append((list(range(start, end)),
+                                       list(range(start, end))))
 
-        # Lockstep pack into a single row per side. Tracks doc spans.
-        s_pack, t_pack = _pack_lockstep(
-            [per_doc_student[i] for i in keep],
-            [per_doc_teacher[i] for i in keep],
-            student_pad_id=self.student_tokenizer.pad_token_id,
-            teacher_pad_id=self.teacher_tokenizer.pad_token_id,
-            student_eos_id=(
-                self.student_tokenizer.eos_token_id
-                if self.add_eos_between_docs
-                else None
-            ),
-            teacher_eos_id=(
-                self.teacher_tokenizer.eos_token_id
-                if self.add_eos_between_docs
-                else None
-            ),
-            student_max_len=self.ctx_length_student,
-            teacher_max_len=self.ctx_length_teacher,
+        # For each row: lockstep-pack its slice, pad to make_seq_div_by_*,
+        # collect tensors + per-doc-aligned pair lists.
+        s_input_ids_rows: List[torch.Tensor] = []
+        s_attn_rows: List[torch.Tensor] = []
+        s_asst_rows: List[torch.Tensor] = []
+        s_doc_id_rows: List[torch.Tensor] = []
+        t_input_ids_rows: List[torch.Tensor] = []
+        t_attn_rows: List[torch.Tensor] = []
+        t_asst_rows: List[torch.Tensor] = []
+        t_doc_id_rows: List[torch.Tensor] = []
+        per_row_pairs: List[List[Tuple[Any, ...]]] = []
+        row_sample_mask: List[float] = []
+        row_idx: List[int] = []
+
+        for s_inds, t_inds in row_chunks:
+            s_pack, t_pack = _pack_lockstep(
+                [per_doc_student[i] for i in s_inds],
+                [per_doc_teacher[i] for i in t_inds],
+                student_pad_id=self.student_tokenizer.pad_token_id,
+                teacher_pad_id=self.teacher_tokenizer.pad_token_id,
+                student_eos_id=(
+                    self.student_tokenizer.eos_token_id
+                    if self.add_eos_between_docs else None
+                ),
+                teacher_eos_id=(
+                    self.teacher_tokenizer.eos_token_id
+                    if self.add_eos_between_docs else None
+                ),
+                student_max_len=self.ctx_length_student,
+                teacher_max_len=self.ctx_length_teacher,
+            )
+            s_ids_t, s_attn_t, s_asst_t, s_doc_id_t = _pad_packed(
+                s_pack, pad_id=self.student_tokenizer.pad_token_id,
+                divisor=self.make_seq_div_by_student,
+            )
+            t_ids_t, t_attn_t, t_asst_t, t_doc_id_t = _pad_packed(
+                t_pack, pad_id=self.teacher_tokenizer.pad_token_id,
+                divisor=self.make_seq_div_by_teacher,
+            )
+            s_input_ids_rows.append(s_ids_t)
+            s_attn_rows.append(s_attn_t)
+            s_asst_rows.append(s_asst_t)
+            s_doc_id_rows.append(s_doc_id_t)
+            t_input_ids_rows.append(t_ids_t)
+            t_attn_rows.append(t_attn_t)
+            t_asst_rows.append(t_asst_t)
+            t_doc_id_rows.append(t_doc_id_t)
+            # Per-doc alignment within this row → returns the flat list
+            # of pack-global-shifted pairs for this row.
+            per_row_pairs.append(
+                self._row_pair_list(s_ids_t, t_ids_t, s_pack, t_pack)
+            )
+            row_sample_mask.append(
+                1.0 if len(s_pack["doc_starts"]) > 0 else 0.0
+            )
+            row_idx.append(per_doc_idx[s_inds[0]] if s_inds else -1)
+
+        # Stack along dim 0 → [N, T] tensors.
+        s_input_ids = torch.cat(s_input_ids_rows, dim=0)
+        s_attn = torch.cat(s_attn_rows, dim=0)
+        s_asst = torch.cat(s_asst_rows, dim=0)
+        s_doc_id = torch.cat(s_doc_id_rows, dim=0)
+        t_input_ids = torch.cat(t_input_ids_rows, dim=0)
+        t_attn = torch.cat(t_attn_rows, dim=0)
+        t_asst = torch.cat(t_asst_rows, dim=0)
+        t_doc_id = torch.cat(t_doc_id_rows, dim=0)
+
+        # One combined AlignmentBatch covering all N rows.
+        alignment = TokenAligner._pairs_to_batch(
+            per_row_pairs,
+            b=N,
+            t_s=s_input_ids.shape[1],
+            t_t=t_input_ids.shape[1],
         )
 
-        # Pad packed lengths up to make_seq_div_by_* by appending pads.
-        s_input_ids, s_attn, s_asst, s_doc_id = _pad_packed(
-            s_pack,
-            pad_id=self.student_tokenizer.pad_token_id,
-            divisor=self.make_seq_div_by_student,
-        )
-        t_input_ids, t_attn, t_asst, t_doc_id = _pad_packed(
-            t_pack,
-            pad_id=self.teacher_tokenizer.pad_token_id,
-            divisor=self.make_seq_div_by_teacher,
-        )
-
-        # Per-doc alignment in the offset_cluster_decode_fix space, then
-        # shift each doc's spans into pack-global indices and concatenate
-        # into a single 1-row AlignmentBatch.
-        alignment = self._align_packed_per_doc(
-            s_input_ids=s_input_ids,
-            t_input_ids=t_input_ids,
-            s_pack=s_pack,
-            t_pack=t_pack,
-        )
-
-        # Loss-side token mask: attention AND assistant content. The loss fn
-        # already respects token_mask, so zeroing scaffold/user tokens here
-        # restricts CE/KL to assistant supervision without touching the loss.
+        # Loss-side token mask: attention AND assistant content.
         student_token_mask = (s_attn * s_asst).long()
         teacher_token_mask = (t_attn * t_asst).long()
 
-        # One packed row per call → batch dim is 1. sample_mask: 1.0 if any
-        # doc fit, else 0.0 (downstream skips zero-mass samples).
-        sample_mask = torch.tensor(
-            [1.0 if len(s_pack["doc_starts"]) > 0 else 0.0],
-            dtype=torch.float32,
-        )
-        idx = [batch[keep[0]]["idx"]] if keep else [-1]
+        sample_mask = torch.tensor(row_sample_mask, dtype=torch.float32)
 
         out = self._build_batched_dict(
             student_input_ids=s_input_ids,
@@ -287,12 +357,54 @@ class CrossTokenizerCollator:
             teacher_token_mask=teacher_token_mask,
             alignment=alignment,
             sample_mask=sample_mask,
-            idx=idx,
+            idx=row_idx,
         )
         # Doc ids surface for downstream sequence_packing (cu_seqlens) wiring.
         out["student_doc_id"] = s_doc_id
         out["teacher_doc_id"] = t_doc_id
         return out
+
+    def _row_pair_list(
+        self,
+        s_input_ids: torch.Tensor,
+        t_input_ids: torch.Tensor,
+        s_pack: Dict[str, Any],
+        t_pack: Dict[str, Any],
+    ) -> List[Tuple[Any, ...]]:
+        """Per-doc alignment for ONE packed row.
+
+        Returns the flat 7-tuple pair list with spans already shifted to
+        pack-global indices. Caller stacks the per-row lists into a single
+        ``per_sample_pairs`` of length ``B`` and runs ``_pairs_to_batch``.
+        """
+        s_ids_list = s_input_ids[0].tolist()
+        t_ids_list = t_input_ids[0].tolist()
+        s_offsets_full = s_pack["offsets"]
+        t_offsets_full = t_pack["offsets"]
+
+        combined_pairs: List[Tuple[Any, ...]] = []
+        for s_start, s_len, t_start, t_len in zip(
+            s_pack["doc_starts"], s_pack["doc_lens"],
+            t_pack["doc_starts"], t_pack["doc_lens"],
+        ):
+            s_slice_ids = s_ids_list[s_start : s_start + s_len]
+            t_slice_ids = t_ids_list[t_start : t_start + t_len]
+            s_slice_off = s_offsets_full[s_start : s_start + s_len]
+            t_slice_off = t_offsets_full[t_start : t_start + t_len]
+            pairs = self.aligner.align_one_offset(
+                s_slice_ids, t_slice_ids, s_slice_off, t_slice_off,
+            )
+            for s_toks, t_toks, s0, s1, t0, t1, ok in pairs:
+                if s0 != -1:
+                    s0 += s_start
+                    s1 += s_start
+                if t0 != -1:
+                    t0 += t_start
+                    t1 += t_start
+                combined_pairs.append(
+                    (s_toks, t_toks, s0, s1, t0, t1, ok)
+                )
+        return combined_pairs
 
     @staticmethod
     def _build_batched_dict(
@@ -333,61 +445,6 @@ class CrossTokenizerCollator:
             alignment_teacher_chunk_id=alignment.teacher_chunk_id,
             alignment_num_chunks=alignment.num_chunks,
             idx=idx,
-        )
-
-    def _align_packed_per_doc(
-        self,
-        *,
-        s_input_ids: torch.Tensor,
-        t_input_ids: torch.Tensor,
-        s_pack: Dict[str, Any],
-        t_pack: Dict[str, Any],
-    ) -> AlignmentBatch:
-        """Per-document alignment within a packed row, then concat into a
-        single-row :class:`AlignmentBatch`.
-
-        Calls :meth:`TokenAligner.align_one_offset` per doc, shifts each
-        doc's per-doc span indices into pack-global indices, and runs
-        :meth:`TokenAligner._pairs_to_batch` once over the combined list.
-        """
-        s_ids_list = s_input_ids[0].tolist()
-        t_ids_list = t_input_ids[0].tolist()
-        s_offsets_full = s_pack["offsets"]
-        t_offsets_full = t_pack["offsets"]
-
-        combined_pairs: List[Tuple[Any, ...]] = []
-        for s_start, s_len, t_start, t_len in zip(
-            s_pack["doc_starts"], s_pack["doc_lens"],
-            t_pack["doc_starts"], t_pack["doc_lens"],
-        ):
-            s_slice_ids = s_ids_list[s_start : s_start + s_len]
-            t_slice_ids = t_ids_list[t_start : t_start + t_len]
-            s_slice_off = s_offsets_full[s_start : s_start + s_len]
-            t_slice_off = t_offsets_full[t_start : t_start + t_len]
-            pairs = self.aligner.align_one_offset(
-                s_slice_ids, t_slice_ids, s_slice_off, t_slice_off,
-            )
-            # Shift each pair's spans by the doc's start offset in the
-            # packed sequence (leave -1 sentinels for orphan sides alone).
-            for s_toks, t_toks, s0, s1, t0, t1, ok in pairs:
-                if s0 != -1:
-                    s0 += s_start
-                    s1 += s_start
-                if t0 != -1:
-                    t0 += t_start
-                    t1 += t_start
-                combined_pairs.append(
-                    (s_toks, t_toks, s0, s1, t0, t1, ok)
-                )
-
-        # Pack the combined list into the dense AlignmentBatch contract
-        # (B=1, T_s=packed_T, T_t=packed_T). _pairs_to_batch handles
-        # max_pairs padding and per-token partition / chunk_id derivation.
-        return TokenAligner._pairs_to_batch(
-            [combined_pairs],
-            b=1,
-            t_s=s_input_ids.shape[1],
-            t_t=t_input_ids.shape[1],
         )
 
     @staticmethod

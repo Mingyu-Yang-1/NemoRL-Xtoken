@@ -224,6 +224,9 @@ def setup(
         # Optional knobs: mode="chat" + add_eos_between_docs for SFT/chat data.
         mode=data_config.get("collator_mode", "text"),
         add_eos_between_docs=data_config.get("add_eos_between_docs", True),
+        # In chat mode, the collator emits num_packed_rows packed rows per
+        # __call__. Must be ≥ dp_size so shard_by_batch_size divides cleanly.
+        num_packed_rows=data_config.get("num_packed_rows", 1),
     )
 
     # ==========================

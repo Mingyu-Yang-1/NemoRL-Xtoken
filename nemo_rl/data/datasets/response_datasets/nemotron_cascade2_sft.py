@@ -19,15 +19,17 @@ from datasets import load_dataset
 from nemo_rl.data.datasets.raw_dataset import RawDataset
 
 
-class NemotronCascade2SFTMathDataset(RawDataset):
-    """Simple wrapper around the Nemotron-Cascade-2-SFT-Data math split.
+class NemotronCascade2SFTDataset(RawDataset):
+    """Simple wrapper around ``nvidia/Nemotron-Cascade-2-SFT-Data``.
 
-    Loads the ``math`` subset of ``nvidia/Nemotron-Cascade-2-SFT-Data`` from
-    HuggingFace.  Each example already contains a ``messages`` field in
-    OpenAI chat format (system / user / assistant turns), so no heavy
-    reformatting is needed.
+    Loads a subset of the dataset from HuggingFace. Each example already
+    contains a ``messages`` field in OpenAI chat format (system / user /
+    assistant turns), so no heavy reformatting is needed.
 
     Args:
+        subset: HuggingFace dataset config name. Common choices: ``"chat"``,
+            ``"math"``, ``"science"``, ``"instruction_following"``. Default
+            ``"chat"``.
         split: HuggingFace dataset split to load, default is "train"
         split_validation_size: Fraction of data held out for validation when
             no dedicated validation split exists, default is 0.05
@@ -39,17 +41,18 @@ class NemotronCascade2SFTMathDataset(RawDataset):
 
     def __init__(
         self,
+        subset: str = "chat",
         split: str = "train",
         split_validation_size: float = 0.05,
         seed: int = 42,
         max_samples: int | None = None,
         **kwargs,
     ) -> None:
-        self.task_name = "Nemotron-Cascade-2-SFT-Math"
+        self.task_name = f"Nemotron-Cascade-2-SFT-{subset.capitalize()}"
 
         self.dataset = load_dataset(
             "nvidia/Nemotron-Cascade-2-SFT-Data",
-            "math",
+            subset,
             split=split,
         )
 
@@ -78,3 +81,7 @@ class NemotronCascade2SFTMathDataset(RawDataset):
             "messages": messages,
             "task_name": self.task_name,
         }
+
+
+# Back-compat alias for the previous math-only class name.
+NemotronCascade2SFTMathDataset = NemotronCascade2SFTDataset
