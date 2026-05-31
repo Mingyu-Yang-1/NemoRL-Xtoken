@@ -98,10 +98,16 @@ policy:
     logprob_mb_tokens: 4096
     sequence_length_round: 64
   sequence_packing:
-    # IMPORTANT: keep this ON for chat mode so the model's attention is
-    # walled at packed doc boundaries (var-len attention with cu_seqlens).
-    # Without it, position 14 in Doc B's slice can attend to position 3 in
-    # Doc A's slice, contaminating Doc B's representation with Doc A.
+    # Enabled for the usual reason: var-len attention via cu_seqlens packs
+    # multiple BATCH ENTRIES into microbatches efficiently.
+    #
+    # NOTE: this flag does NOT isolate WITHIN-ROW docs in chat mode.
+    # When our chat collator packs Doc-A and Doc-B into the same row,
+    # position 14 (Doc-B) can still attend to position 3 (Doc-A) — the
+    # framework's bin-packer walls only between rows. See A2 in the
+    # collator's _call_chat comment for the proper within-row isolation
+    # options. Deferred: contamination is symmetric across student and
+    # teacher → KL signal stays consistent → likely benign in practice.
     enabled: true
     train_mb_tokens: 4096
     logprob_mb_tokens: 4096

@@ -384,7 +384,23 @@ class CrossTokenizerCollator:
             sample_mask=sample_mask,
             idx=row_idx,
         )
-        # Doc ids surface for downstream sequence_packing (cu_seqlens) wiring.
+        # Per-token doc id tensors are emitted but currently CONSUMED BY NO
+        # ONE in the training path. They're reserved for a future fix to A2
+        # (cross-doc attention contamination within a packed row): tokens
+        # from Doc-A and Doc-B in the same row see each other's hidden states.
+        # NeMo-RL's policy.sequence_packing.enabled=true does NOT isolate
+        # within a row — it only walls between batch entries via cu_seqlens.
+        # Within-row isolation needs one of:
+        #   (a) build a [T, T] doc-id-equality attention mask from these
+        #       tensors in the policy worker (FlashAttention backend
+        #       compatibility caveat),
+        #   (b) build per-row cu_seqlens from doc_starts/doc_lens and inject
+        #       into flash_attn_kwargs (bypasses framework auto-construction),
+        #   (c) set num_packed_rows high enough that each row averages 1 doc.
+        # In practice the contamination is likely benign: both student and
+        # teacher see the same contaminated context, so the KL signal is
+        # consistent; loss only fires on assistant content. Deferred to a
+        # follow-up if metrics show measurable regression.
         out["student_doc_id"] = s_doc_id
         out["teacher_doc_id"] = t_doc_id
         return out
