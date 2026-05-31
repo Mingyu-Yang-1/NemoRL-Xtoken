@@ -98,17 +98,18 @@ policy:
     logprob_mb_tokens: 4096
     sequence_length_round: 64
   sequence_packing:
-    # Enabled for the usual reason: var-len attention via cu_seqlens packs
-    # multiple BATCH ENTRIES into microbatches efficiently.
+    # MUST be false for chat distillation. The teacher's
+    # get_full_logits_ipc path explicitly raises NotImplementedError when
+    # sequence_packing is enabled (framework limitation in v0). Tried with
+    # this on in commit 785c370; got "NotImplementedError:
+    # get_full_logits_ipc does not support dynamic batching or sequence
+    # packing in v0." at step 1.
     #
-    # NOTE: this flag does NOT isolate WITHIN-ROW docs in chat mode.
-    # When our chat collator packs Doc-A and Doc-B into the same row,
-    # position 14 (Doc-B) can still attend to position 3 (Doc-A) — the
-    # framework's bin-packer walls only between rows. See A2 in the
-    # collator's _call_chat comment for the proper within-row isolation
-    # options. Deferred: contamination is symmetric across student and
-    # teacher → KL signal stays consistent → likely benign in practice.
-    enabled: true
+    # Side effect (A2 deferred): cross-doc attention within a packed row
+    # is NOT walled. See the collator's _call_chat comment for the
+    # discussion. Contamination is symmetric on both student and teacher,
+    # so the KL signal stays consistent and the issue is likely benign.
+    enabled: false
     train_mb_tokens: 4096
     logprob_mb_tokens: 4096
     algorithm: "modified_first_fit_decreasing"
@@ -165,7 +166,8 @@ teacher:
     logprob_mb_tokens: 4096
     sequence_length_round: 64
   sequence_packing:
-    enabled: true
+    # Must be false — see policy.sequence_packing comment above.
+    enabled: false
     train_mb_tokens: 4096
     logprob_mb_tokens: 4096
     algorithm: "modified_first_fit_decreasing"
