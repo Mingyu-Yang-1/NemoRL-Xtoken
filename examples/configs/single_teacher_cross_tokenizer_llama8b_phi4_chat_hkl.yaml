@@ -176,21 +176,22 @@ data:
   max_input_seq_length: 4096
   shuffle: true
   num_workers: 4
-  # NEW: switch the collator into chat mode. With "text" (default), behavior
-  # is identical to the base-model arrow_text configs. With "chat", the
-  # collator does chat-template + assistant mask + lockstep packing.
+  # Switch the collator into chat mode. With "text" (default), behavior is
+  # identical to the base-model arrow_text configs. With "chat", the
+  # collator does chat-template + assistant mask + lockstep packing per row.
   collator_mode: "chat"
   add_eos_between_docs: true
+  # MUST equal policy.train_global_batch_size (see below). The chat
+  # collator emits B = num_packed_rows packed rows per __call__; the
+  # trainer's shard_by_batch_size(dp_size) needs B % dp_size == 0.
+  # At dp_size = 256 (32 nodes × 8 GPUs ÷ TP=1 ÷ CP=1) and
+  # train_global_batch_size=768, B=768 gives each rank 3 rows per step.
+  num_packed_rows: 768
   train:
-    # NOTE: the chat data source is intentionally unfilled — set this to
-    # your SFT dataset of choice. Any source that emits rows with a
-    # "messages" or "conversation" field works (chat_kd_processor handles
-    # both). Example HF datasets: "HuggingFaceH4/ultrachat_200k",
-    # "teknium/OpenHermes-2.5", or a local arrow shard.
-    dataset_name: "TODO_chat_dataset_name"
+    dataset_name: "Nemotron-Cascade-2-SFT"
+    subset: "chat"
     processor: "chat_kd_processor"
-    # arrow_files: "/path/to/your/chat/arrow/shards/*.arrow"
-    # text_key / characters_per_sample are NOT used in chat mode.
+    split_validation_size: 0.0
   validation: null
 
 logger:
