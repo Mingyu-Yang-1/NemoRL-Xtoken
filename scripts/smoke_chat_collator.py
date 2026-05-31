@@ -155,9 +155,21 @@ def main() -> int:
     ]
     ok(f"docs packed per row = {docs_per_row} (sum={sum(docs_per_row)} of {len(samples)})")
 
-    # sample_mask sanity: rows with 0 docs should be 0.0, rest 1.0
+    # sample_mask sanity: with greedy-refill, every row should be 1.0
+    # whenever at least one candidate fit lockstep.
     sm = out['sample_mask'].tolist()
     ok(f"sample_mask         = {sm}")
+    n_empty = sum(1 for v in sm if v == 0.0)
+    if n_empty > 0:
+        # only acceptable if ALL rows are empty (all-candidates-failed case)
+        if any(v != 0.0 for v in sm):
+            fail(
+                f"greedy-refill broken: {n_empty} empty rows but others "
+                "are non-empty (refill should have filled them)"
+            )
+        ok("all rows empty (degenerate: no candidate fit) — expected")
+    else:
+        ok("greedy-refill OK — zero empty rows when ≥1 candidate fit")
 
     # Alignment payload non-trivial.
     pairs = int(out['alignment_pair_valid'].sum())

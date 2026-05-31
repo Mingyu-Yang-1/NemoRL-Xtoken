@@ -231,30 +231,24 @@ class CrossTokenizerCollator:
             per_doc_teacher.append(t_tok)
             per_doc_idx.append(batch[i]["idx"])
 
-        # Split surviving candidates into num_packed_rows groups
-        # (contiguous chunks; first row gets the first ceil(K/N) docs,
-        # etc.). Chunked beats round-robin because adjacent samples in a
-        # shuffled dataloader are independent — there's no locality to
-        # preserve, but chunked keeps the per-row doc count balanced.
+        # Split surviving candidates into num_packed_rows chunks (contiguous;
+        # first row gets the first ceil(K/N) docs, etc.). Within each chunk,
+        # lockstep packing accepts whichever docs fit BOTH budgets.
         #
-        # TODO (empty-row backward bug): when chunk_size=1 and some
-        # candidates don't fit ctx_length, rows assigned those candidates
-        # come out with sample_mask=0 / token_mask=0. Under FSDP/DDP with
-        # dp_size>1, ranks whose row is empty have no autograd graph
-        # to backprop through, and the loss tensor materializes as a
-        # graph-detached zero → backward() raises ``RuntimeError: element
-        # 0 of tensors does not require grad and does not have a grad_fn``.
-        # Fix needs either: (a) greedy-refill so no row is empty (pull
-        # from non-empty neighbors when a chunk is empty), or (b) make
-        # the trainer/loss handle all-zero token_mask rows gracefully
-        # (skip the iteration on the rank, or replicate a non-empty
-        # row's gradient contribution to keep ranks in lockstep).
+        # Pass 1: try chunked assignment.
+        # Pass 2 (greedy-refill): for any row that came out empty, duplicate
+        # a doc from a non-empty row into it. This avoids the empty-row
+        # backward bug: when a rank's token_mask is all zeros, its loss is
+        # a graph-detached zero and FSDP backward fails with "element 0 of
+        # tensors does not require grad and does not have a grad_fn".
+        # Refill makes that case deterministic-non-empty as long as ANY
+        # candidate fit; the degenerate "all 64 candidates failed" case is
+        # rare in practice (cascade-2 at ctx≥2048 packs >99% of rows) and
+        # left as a documented residual edge case.
         N = self.num_packed_rows
         K = len(per_doc_student)
         if K == 0:
-            row_chunks: List[Tuple[List[int], List[int]]] = [
-                ([], []) for _ in range(N)
-            ]
+            row_chunks: List[List[int]] = [[] for _ in range(N)]
         else:
             chunk = max(1, (K + N - 1) // N)
             row_chunks = []
@@ -262,13 +256,64 @@ class CrossTokenizerCollator:
                 start = r * chunk
                 end = min(start + chunk, K)
                 if start >= K:
-                    row_chunks.append(([], []))
+                    row_chunks.append([])
                 else:
-                    row_chunks.append((list(range(start, end)),
-                                       list(range(start, end))))
+                    row_chunks.append(list(range(start, end)))
 
-        # For each row: lockstep-pack its slice, pad to make_seq_div_by_*,
-        # collect tensors + per-doc-aligned pair lists.
+        pad_s = self.student_tokenizer.pad_token_id
+        pad_t = self.teacher_tokenizer.pad_token_id
+        eos_s = (
+            self.student_tokenizer.eos_token_id
+            if self.add_eos_between_docs else None
+        )
+        eos_t = (
+            self.teacher_tokenizer.eos_token_id
+            if self.add_eos_between_docs else None
+        )
+
+        def _pack_inds(inds: List[int]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            return _pack_lockstep(
+                [per_doc_student[i] for i in inds],
+                [per_doc_teacher[i] for i in inds],
+                student_pad_id=pad_s, teacher_pad_id=pad_t,
+                student_eos_id=eos_s, teacher_eos_id=eos_t,
+                student_max_len=self.ctx_length_student,
+                teacher_max_len=self.ctx_length_teacher,
+            )
+
+        # Pass 1: pack each row from its chunk.
+        # row_packs[r] = (s_pack, t_pack, source_inds_used)
+        row_packs: List[Tuple[Dict[str, Any], Dict[str, Any], List[int]]] = []
+        for inds in row_chunks:
+            s_pack, t_pack = _pack_inds(inds)
+            row_packs.append((s_pack, t_pack, inds))
+
+        # Pass 2: greedy-refill empty rows. Collect indices of docs that
+        # actually fit (i.e., were accepted by lockstep in some row); these
+        # are guaranteed to fit when packed alone too. Refill in round-
+        # robin to spread duplication.
+        fitted_doc_indices: List[int] = []
+        for sp, _tp, inds in row_packs:
+            for local in sp["accepted_indices"]:
+                fitted_doc_indices.append(inds[local])
+
+        if fitted_doc_indices:
+            refill_cursor = 0
+            for r in range(N):
+                sp, _tp, _inds = row_packs[r]
+                if sp["doc_starts"]:
+                    continue
+                src = fitted_doc_indices[refill_cursor % len(fitted_doc_indices)]
+                refill_cursor += 1
+                s_pack_r, t_pack_r = _pack_inds([src])
+                row_packs[r] = (s_pack_r, t_pack_r, [src])
+        # else: K == 0 or no candidate fits → all rows stay empty, loss
+        # will be a graph-detached 0 and backward will fail. This is a
+        # documented residual edge case; in practice it requires either
+        # an empty batch or every candidate exceeding both ctx budgets.
+
+        # Collate the (possibly refilled) packs into [N, T] tensors + the
+        # per-row alignment pair lists.
         s_input_ids_rows: List[torch.Tensor] = []
         s_attn_rows: List[torch.Tensor] = []
         s_asst_rows: List[torch.Tensor] = []
@@ -281,30 +326,12 @@ class CrossTokenizerCollator:
         row_sample_mask: List[float] = []
         row_idx: List[int] = []
 
-        for s_inds, t_inds in row_chunks:
-            s_pack, t_pack = _pack_lockstep(
-                [per_doc_student[i] for i in s_inds],
-                [per_doc_teacher[i] for i in t_inds],
-                student_pad_id=self.student_tokenizer.pad_token_id,
-                teacher_pad_id=self.teacher_tokenizer.pad_token_id,
-                student_eos_id=(
-                    self.student_tokenizer.eos_token_id
-                    if self.add_eos_between_docs else None
-                ),
-                teacher_eos_id=(
-                    self.teacher_tokenizer.eos_token_id
-                    if self.add_eos_between_docs else None
-                ),
-                student_max_len=self.ctx_length_student,
-                teacher_max_len=self.ctx_length_teacher,
-            )
+        for s_pack, t_pack, inds in row_packs:
             s_ids_t, s_attn_t, s_asst_t, s_doc_id_t = _pad_packed(
-                s_pack, pad_id=self.student_tokenizer.pad_token_id,
-                divisor=self.make_seq_div_by_student,
+                s_pack, pad_id=pad_s, divisor=self.make_seq_div_by_student,
             )
             t_ids_t, t_attn_t, t_asst_t, t_doc_id_t = _pad_packed(
-                t_pack, pad_id=self.teacher_tokenizer.pad_token_id,
-                divisor=self.make_seq_div_by_teacher,
+                t_pack, pad_id=pad_t, divisor=self.make_seq_div_by_teacher,
             )
             s_input_ids_rows.append(s_ids_t)
             s_attn_rows.append(s_attn_t)
@@ -314,15 +341,13 @@ class CrossTokenizerCollator:
             t_attn_rows.append(t_attn_t)
             t_asst_rows.append(t_asst_t)
             t_doc_id_rows.append(t_doc_id_t)
-            # Per-doc alignment within this row → returns the flat list
-            # of pack-global-shifted pairs for this row.
             per_row_pairs.append(
                 self._row_pair_list(s_ids_t, t_ids_t, s_pack, t_pack)
             )
             row_sample_mask.append(
                 1.0 if len(s_pack["doc_starts"]) > 0 else 0.0
             )
-            row_idx.append(per_doc_idx[s_inds[0]] if s_inds else -1)
+            row_idx.append(per_doc_idx[inds[0]] if inds else -1)
 
         # Stack along dim 0 → [N, T] tensors.
         s_input_ids = torch.cat(s_input_ids_rows, dim=0)
@@ -640,6 +665,7 @@ def _pack_lockstep(
 
         input_ids, asst_mask, offsets, doc_id          : list of length=accumulated
         doc_starts, doc_lens                           : per-doc bookkeeping
+        accepted_indices                               : input indices that fit
     """
     add_eos_s = student_eos_id is not None
     add_eos_t = teacher_eos_id is not None
@@ -647,7 +673,7 @@ def _pack_lockstep(
     def _empty() -> Dict[str, Any]:
         return {
             "input_ids": [], "asst_mask": [], "offsets": [], "doc_id": [],
-            "doc_starts": [], "doc_lens": [],
+            "doc_starts": [], "doc_lens": [], "accepted_indices": [],
         }
     s = _empty()
     t = _empty()
@@ -658,6 +684,8 @@ def _pack_lockstep(
         if (len(s["input_ids"]) + len(sd["input_ids"]) + s_extra > student_max_len
                 or len(t["input_ids"]) + len(td["input_ids"]) + t_extra > teacher_max_len):
             continue
+        s["accepted_indices"].append(doc_idx)
+        t["accepted_indices"].append(doc_idx)
 
         # Append doc tokens + optional EOS separator (mask=0 on EOS so it
         # doesn't contribute loss; offsets=(0,0) so the offset aligner
