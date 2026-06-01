@@ -198,34 +198,34 @@ class CrossTokenizerCollator:
     # chat-mode (SFT/instruct): lockstep packing + per-doc alignment
     # ------------------------------------------------------------------ #
     def _call_chat(self, batch: List[DatumSpec]) -> BatchedDataDict[Any]:
-        # Pavlo's design for cross-tokenizer chat: render once on the
-        # STUDENT side, then tokenize that same rendered text with the
-        # teacher tokenizer too. Both sides' offsets then live in the same
-        # character coordinate system, which is what makes
-        # offset_cluster_decode_fix produce meaningful cross-side pairs.
-        # Trade-off: the teacher sees Llama-format scaffold (special token
-        # strings broken into sub-tokens by its BPE) instead of its own
-        # native chat scaffolding. For KL extraction this works in
-        # practice; the teacher still produces a probability distribution
-        # we can target.
+        # Native-template chat mode: each side renders + tokenizes with its
+        # OWN chat template. The teacher gets in-distribution input (vs the
+        # earlier student-rendered hack which fed it Llama-format scaffold
+        # that its BPE breaks into sub-tokens). Per-assistant-message
+        # offset rebasing in the aligner (align_one_offset_per_asst) lets
+        # offset_cluster still work: we slice asst-content tokens per asst
+        # message and rebase their offsets to start at 0 on each side,
+        # where they now share a coordinate system.
         messages_list = [datum[self.messages_key] for datum in batch]
 
-        per_doc_student: List[Dict[str, Any] | None] = []
-        per_doc_teacher: List[Dict[str, Any] | None] = []
+        per_doc_student: List[Dict[str, Any]] = []
+        per_doc_teacher: List[Dict[str, Any]] = []
         per_doc_idx: List[int] = []
         for i, m in enumerate(messages_list):
-            student_text, s_tok = _render_student_and_tokenize(
+            s_tok = _render_and_tokenize(
                 self.student_tokenizer, m, self.ctx_length_student,
             )
-            if student_text is None:
+            if s_tok is None:
                 continue
-            # Teacher tokenizes the SAME student-rendered text — NOT its
-            # own template render. Offsets land in student_text's space.
-            t_tok = _tokenize_text_with_assistant_mask(
-                self.teacher_tokenizer, student_text, m,
-                self.ctx_length_teacher,
+            t_tok = _render_and_tokenize(
+                self.teacher_tokenizer, m, self.ctx_length_teacher,
             )
             if t_tok is None:
+                continue
+            # Both sides must enumerate the same number of asst turns for
+            # per-msg alignment. Chat templates can rarely strip turns
+            # differently — skip the row if so.
+            if len(s_tok["asst_char_spans"]) != len(t_tok["asst_char_spans"]):
                 continue
             per_doc_student.append(s_tok)
             per_doc_teacher.append(t_tok)
@@ -424,16 +424,28 @@ class CrossTokenizerCollator:
         t_offsets_full = t_pack["offsets"]
 
         combined_pairs: List[Tuple[Any, ...]] = []
-        for s_start, s_len, t_start, t_len in zip(
+        s_doc_spans = s_pack.get("doc_asst_char_spans", [])
+        t_doc_spans = t_pack.get("doc_asst_char_spans", [])
+        for di, (s_start, s_len, t_start, t_len) in enumerate(zip(
             s_pack["doc_starts"], s_pack["doc_lens"],
             t_pack["doc_starts"], t_pack["doc_lens"],
-        ):
+        )):
             s_slice_ids = s_ids_list[s_start : s_start + s_len]
             t_slice_ids = t_ids_list[t_start : t_start + t_len]
             s_slice_off = s_offsets_full[s_start : s_start + s_len]
             t_slice_off = t_offsets_full[t_start : t_start + t_len]
-            pairs = self.aligner.align_one_offset(
-                s_slice_ids, t_slice_ids, s_slice_off, t_slice_off,
+            # Pass per-doc asst_mask so the aligner excludes
+            # <think>...</think> sub-tokens from partition_mask.
+            s_slice_asst = s_pack["asst_mask"][s_start : s_start + s_len]
+            t_slice_asst = t_pack["asst_mask"][t_start : t_start + t_len]
+            # Per-asst alignment uses each side's native chat-template
+            # offsets, slicing tokens per asst message and rebasing
+            # offsets into a shared per-message coordinate system.
+            pairs = self.aligner.align_one_offset_per_asst(
+                s_slice_ids, s_slice_off, s_doc_spans[di],
+                t_slice_ids, t_slice_off, t_doc_spans[di],
+                student_asst_mask=s_slice_asst,
+                teacher_asst_mask=t_slice_asst,
             )
             for s_toks, t_toks, s0, s1, t0, t1, ok in pairs:
                 if s0 != -1:
@@ -557,12 +569,12 @@ def _tokenize_text_with_assistant_mask(
 ) -> Dict[str, Any] | None:
     """Tokenize a pre-rendered text and build a per-token assistant mask.
 
-    Used by both sides of the chat-mode collator. The student calls this
-    with its own rendered text; the teacher calls it with the **student's**
-    rendered text (Pavlo's design — see :meth:`CrossTokenizerCollator._call_chat`)
-    so both sides' offsets live in the same character coordinate system.
-    That's what makes ``offset_cluster_decode_fix`` produce meaningful
-    cross-side pairs on chat data.
+    In native-template chat mode each side renders its OWN chat template and
+    calls this with that text. The returned ``asst_char_spans`` list lets
+    downstream alignment slice tokens per asst message and rebase offsets to
+    a common (0 → len(content)) coordinate system per slice — so
+    offset_cluster works on each side's native scaffold despite the
+    full-sequence offsets being in different coordinate systems.
 
     Important:
       * ``add_special_tokens=False`` — the rendered text already contains
@@ -603,9 +615,13 @@ def _tokenize_text_with_assistant_mask(
     # rendered text. Tokens whose (cs, ce) falls inside an assistant
     # `content` span are marked 1; everything else (template scaffolding,
     # user content, padding) is 0. <think>...</think> sub-spans inside
-    # assistant content also get 0.
+    # assistant content also get 0. asst_char_spans records the
+    # (start_char, end_char) of each assistant message's content within
+    # the rendered text; the cross-tokenizer aligner uses this to slice
+    # asst-content tokens and rebase their offsets per message.
     mask = [0] * len(ids)
     cursor = 0
+    asst_char_spans: List[Tuple[int, int]] = []
     for m in messages:
         if m.get("role") != "assistant":
             continue
@@ -617,6 +633,7 @@ def _tokenize_text_with_assistant_mask(
             continue
         end_pos = pos + len(content)
         cursor = end_pos
+        asst_char_spans.append((pos, end_pos))
         think_ranges = [
             (pos + mt.start(), pos + mt.end())
             for mt in _THINK_PATTERN.finditer(content)
@@ -636,27 +653,28 @@ def _tokenize_text_with_assistant_mask(
         "input_ids": ids,
         "offsets": [tuple(o) for o in offsets],
         "asst_mask": mask,
+        "asst_char_spans": asst_char_spans,
     }
 
 
-def _render_student_and_tokenize(
+def _render_and_tokenize(
     tokenizer: PreTrainedTokenizerBase,
     messages: List[Dict[str, str]],
     max_len: int,
-) -> Tuple[str, Dict[str, Any]] | Tuple[None, None]:
-    """Convenience wrapper: render student chat template + tokenize.
+) -> Dict[str, Any] | None:
+    """Apply tokenizer's OWN chat template, tokenize, and build the asst
+    mask + asst char spans.
 
-    Returns ``(rendered_text, tokenization_dict)`` so the caller can feed
-    the same ``rendered_text`` into the teacher tokenizer for coordinate-
-    system parity. Returns ``(None, None)`` when either step fails.
+    Each side calls this independently with its own tokenizer in the
+    native-template chat mode — the teacher gets in-distribution input
+    and per-asst-message offset rebasing keeps the cross-tokenizer
+    aligner working. Returns ``None`` when render or asst-content
+    extraction fails so the caller can skip the row.
     """
     text = _render_chat_text(tokenizer, messages)
     if text is None:
-        return None, None
-    tok = _tokenize_text_with_assistant_mask(tokenizer, text, messages, max_len)
-    if tok is None:
-        return None, None
-    return text, tok
+        return None
+    return _tokenize_text_with_assistant_mask(tokenizer, text, messages, max_len)
 
 
 def _pack_lockstep(
@@ -690,6 +708,13 @@ def _pack_lockstep(
         return {
             "input_ids": [], "asst_mask": [], "offsets": [], "doc_id": [],
             "doc_starts": [], "doc_lens": [], "accepted_indices": [],
+            # Per-doc list of (start_char, end_char) ranges marking each
+            # assistant message's content WITHIN THAT DOC'S RENDERED TEXT.
+            # Char positions are in the original (pre-pack) coordinate
+            # system of the doc, NOT the packed sequence's text space —
+            # they're consumed by the aligner together with the doc's own
+            # offsets/ids slice.
+            "doc_asst_char_spans": [],
         }
     s = _empty()
     t = _empty()
@@ -718,6 +743,7 @@ def _pack_lockstep(
             s["doc_id"].append(doc_idx)
         s["doc_starts"].append(s_start)
         s["doc_lens"].append(len(sd["input_ids"]) + s_extra)
+        s["doc_asst_char_spans"].append(sd.get("asst_char_spans", []))
 
         t_start = len(t["input_ids"])
         t["input_ids"].extend(td["input_ids"])
@@ -731,6 +757,7 @@ def _pack_lockstep(
             t["doc_id"].append(doc_idx)
         t["doc_starts"].append(t_start)
         t["doc_lens"].append(len(td["input_ids"]) + t_extra)
+        t["doc_asst_char_spans"].append(td.get("asst_char_spans", []))
 
     # Pad each side to its max_len with pads (mask=0, offsets=(0,0), doc_id=-1).
     for pack, pad_id, max_len in [

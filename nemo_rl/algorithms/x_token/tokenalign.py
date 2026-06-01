@@ -404,6 +404,130 @@ class TokenAligner:
             ]
         return pairs
 
+    def align_one_offset_per_asst(
+        self,
+        student_ids: List[int],
+        student_offsets: List[Tuple[int, int]],
+        student_asst_char_spans: List[Tuple[int, int]],
+        teacher_ids: List[int],
+        teacher_offsets: List[Tuple[int, int]],
+        teacher_asst_char_spans: List[Tuple[int, int]],
+        student_asst_mask: List[int] | None = None,
+        teacher_asst_mask: List[int] | None = None,
+    ) -> List[Tuple[Any, ...]]:
+        """Per-assistant-message offset_cluster_decode_fix alignment.
+
+        Used by the chat collator's NATIVE-template mode where each side
+        has its own rendered text, so full-sequence offsets are in
+        different coordinate systems. For each assistant message:
+
+        1. Find student/teacher tokens whose offsets fall fully inside the
+           message's content char range on their respective sides.
+        2. Rebase those slice offsets by the asst content's char-start on
+           each side. Both slices now have offsets in 0 → len(content),
+           a SHARED coordinate system per message.
+        3. Run ``align_by_offsets_cluster`` on the slices.
+        4. Translate slice-local positions back to full-sequence positions
+           via the per-message token-index lists.
+
+        Scaffold and user-content tokens are NOT included in alignment.
+        ``token_mask = attention_mask * assistant_mask`` already zeros
+        them out of loss, and ``_pairs_to_batch``'s chunk_id / partition
+        masks naturally cover only aligned positions.
+
+        Returns a flat 7-tuple list with full-sequence position indices.
+        """
+        from nemo_rl.algorithms.x_token.offset_alignment import (
+            align_by_offsets_cluster,
+        )
+
+        if len(student_asst_char_spans) != len(teacher_asst_char_spans):
+            raise ValueError(
+                f"asst message count mismatch: "
+                f"{len(student_asst_char_spans)} vs "
+                f"{len(teacher_asst_char_spans)}"
+            )
+
+        combined: List[Tuple[Any, ...]] = []
+        for (s_start_c, s_end_c), (t_start_c, t_end_c) in zip(
+            student_asst_char_spans, teacher_asst_char_spans
+        ):
+            # Token indices whose char-range lies fully inside the asst
+            # content span. Boundary tokens (which straddle scaffold and
+            # content) are excluded — they aren't asst-mask=1 anyway.
+            # When asst_mask is provided, also exclude <think>...</think>
+            # sub-spans (whose tokens are inside asst content char range
+            # but have asst_mask=0) so partition_mask matches what the
+            # loss actually supervises.
+            s_idx = [
+                i for i, (cs, ce) in enumerate(student_offsets)
+                if cs >= s_start_c and ce <= s_end_c and ce > cs
+                and (student_asst_mask is None or student_asst_mask[i] == 1)
+            ]
+            t_idx = [
+                j for j, (cs, ce) in enumerate(teacher_offsets)
+                if cs >= t_start_c and ce <= t_end_c and ce > cs
+                and (teacher_asst_mask is None or teacher_asst_mask[j] == 1)
+            ]
+            if not s_idx or not t_idx:
+                continue
+
+            s_slice_ids = [student_ids[i] for i in s_idx]
+            t_slice_ids = [teacher_ids[j] for j in t_idx]
+            # Rebase offsets to start at 0 on both sides — now they
+            # share coordinates and offset_cluster can match strictly.
+            s_slice_off = [
+                (student_offsets[i][0] - s_start_c,
+                 student_offsets[i][1] - s_start_c)
+                for i in s_idx
+            ]
+            t_slice_off = [
+                (teacher_offsets[j][0] - t_start_c,
+                 teacher_offsets[j][1] - t_start_c)
+                for j in t_idx
+            ]
+
+            slice_pairs = align_by_offsets_cluster(
+                s_slice_ids, s_slice_off, self.student_tokenizer,
+                t_slice_ids, t_slice_off, self.teacher_tokenizer,
+            )
+
+            # Decode-fix recompute (matches align_one_offset semantics).
+            if slice_pairs:
+                pairs_6 = [
+                    (p[0], p[1], p[2], p[3], p[4], p[5]) for p in slice_pairs
+                ]
+                mask = _alignment_mask(
+                    pairs_6,
+                    student_ids_seq=s_slice_ids,
+                    teacher_ids_seq=t_slice_ids,
+                    student_tokenizer=self.student_tokenizer,
+                    teacher_tokenizer=self.teacher_tokenizer,
+                )
+                slice_pairs = [
+                    (p[0], p[1], p[2], p[3], p[4], p[5], m)
+                    for p, m in zip(pairs_6, mask)
+                ]
+
+            # Translate slice-local positions [0, len(slice)] back to
+            # full-sequence positions via the s_idx / t_idx lookup.
+            for s_toks, t_toks, s0, s1, t0, t1, ok in slice_pairs:
+                if s0 != -1:
+                    full_s0 = s_idx[s0]
+                    full_s1 = s_idx[s1 - 1] + 1
+                else:
+                    full_s0 = full_s1 = -1
+                if t0 != -1:
+                    full_t0 = t_idx[t0]
+                    full_t1 = t_idx[t1 - 1] + 1
+                else:
+                    full_t0 = full_t1 = -1
+                combined.append(
+                    (s_toks, t_toks, full_s0, full_s1, full_t0, full_t1, ok)
+                )
+
+        return combined
+
     def _align_batch_offset_cluster(
         self,
         student_ids: torch.Tensor,
